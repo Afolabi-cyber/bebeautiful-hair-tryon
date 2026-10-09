@@ -188,10 +188,19 @@ def hair_zone(src_shape, src_lm: np.ndarray, shape: dict | None, bangs: bool = F
     else:  # unknown outline: sides of the head down to the shoulders
         cv2.ellipse(zone, tuple(np.round(src_lm[FOREHEAD]).astype(int)), (int(1.3 * g.width), int(1.6 * g.height)), 0, 0, 360, 1, -1)
     # The whole top of the head and the hairline are always editable.
-    cv2.ellipse(zone, tuple(np.round(src_lm[FOREHEAD] + g.up * 0.1 * g.height).astype(int)),
-                (int(1.05 * g.width), int(0.85 * g.height)), 0, 0, 360, 1, -1)
+    zone[head_area(src_shape, src_lm) > 0.5] = 1
     zone[keep_mask(src_shape, src_lm, bangs) > 0] = 0
     return zone
+
+
+def head_area(src_shape, src_lm: np.ndarray) -> np.ndarray:
+    """float 0/1 ellipse over the top of the head: crown, hairline, temples and ears."""
+    H, W = src_shape[:2]
+    g = geom(src_lm)
+    m = np.zeros((H, W), np.float32)
+    cv2.ellipse(m, tuple(np.round(src_lm[FOREHEAD] + g.up * 0.1 * g.height).astype(int)),
+                (int(1.05 * g.width), int(0.85 * g.height)), 0, 0, 360, 1.0, -1)
+    return m
 
 
 def transfer_hair(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.ndarray | None,
@@ -250,6 +259,20 @@ def transfer_hair(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: 
     if old.any():
         old = cv2.dilate(old, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * max(2, int(0.008 * W)) + 1,) * 2))
         base = cv2.inpaint(base, old, max(3, int(0.012 * W)), cv2.INPAINT_TELEA)
+
+    # Flush fit: on the head itself (crown, hairline, temples, round the ears) the AI's picture is
+    # used wherever the customer's old hair was or the AI drew hair, so the wig sits on the scalp the
+    # way the AI seated it, with no strip of old hair, smudge or backdrop between wig and head.
+    # Where the AI shows background there, the studio backdrop goes in (it is not "person").
+    # The face below the brows stays the customer's own (keep_mask).
+    head = head_area(src.shape, src_lm)
+    head[keep_mask(src.shape, src_lm) > 0] = 0
+    head = cv2.GaussianBlur(head, (0, 0), max(1.5, 0.006 * W))
+    hair_src = np.clip((seg_src[..., HAIR] - 0.25) / 0.4, 0, 1) if seg_src is not None else np.zeros((H, W), np.float32)
+    hair_src = cv2.dilate(hair_src, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * max(2, int(0.01 * W)) + 1,) * 2))
+    not_bg_out = 1 - np.clip(to_src(np.ascontiguousarray(seg_out[..., BG])), 0, 1)
+    flush = head * np.maximum(hair_src, p) * np.clip((not_bg_out - 0.3) / 0.4, 0, 1)
+    a = np.maximum(a, cv2.GaussianBlur(flush, (0, 0), 1.0))
 
     final = base.astype(np.float32) * (1 - a[..., None]) + out_s * a[..., None]
 

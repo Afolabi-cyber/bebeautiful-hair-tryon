@@ -23,7 +23,7 @@ import catalog_store
 import db
 from status import STATUS
 from admin import router as admin_router
-from faces import HAIR, FaceTool, Segmenter, hair_zone, head_crop, openai_mask_png, transfer_hair, wig_shape
+from faces import HAIR, FaceTool, Segmenter, hair_zone, head_crop, keep_mask, openai_mask_png, transfer_hair, wig_shape
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -136,8 +136,11 @@ def build_prompt(p: dict) -> str:
         "faithfully: the same braid size and pattern, the same parting, the same curl type and where "
         "the curls start, the same colours and ombre in the same places, the same length and volume. "
         "Do not invent a different hairstyle and do not change the wig's colours. Seat the wig "
-        "naturally on the customer's head with the hairline at their forehead, hide all of their own "
-        "hair underneath it, let the hair fall over the shoulders and down the body as long as the wig "
+        "flush and snug on the customer's head like a professionally installed wig: it hugs the scalp "
+        "and the shape of the skull at the crown and sides, with no gap, lift or space between the wig "
+        "and the head, no visible cap, lace or edges, and the wig's hairline blends naturally into the "
+        "skin of their forehead and temples. Hide all of their own hair underneath it so none of it "
+        "shows at the hairline, temples, sides, ears or neck. Let the hair fall over the shoulders and down the body as long as the wig "
         "is, and match the camera angle of image 1. Use soft, even, flattering light on the face and hair, "
         "like a good beauty photo, so it looks like a real professional photo.\n"
         "Do not change the customer in any other way. Keep their face identical: same facial features, "
@@ -307,6 +310,19 @@ async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
         catalog_store.shapes[p["id"]] = wig_shape(wig_rgb)
     # The AI may only edit this fenced area (wig outline on the head + margin, minus the face).
     zone = hair_zone(crop.shape, lm, catalog_store.shapes[p["id"]], bangs)
+    # Also let the AI repaint all of the customer's own hair, so it can hide it under the wig and
+    # seat the wig flush instead of leaving old hair (or a gap) next to it. The face stays locked.
+    try:
+        seg_src = await segment(crop)
+    except Exception:
+        log.exception("Hair model failed on this photo")
+        seg_src = None
+    if seg_src is not None:
+        old_hair = (seg_src[..., HAIR] > 0.35).astype(np.uint8)
+        g = max(3, int(0.03 * OUT_W))
+        old_hair = cv2.dilate(old_hair, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * g + 1, 2 * g + 1)))
+        zone = np.maximum(zone, old_hair)
+        zone[keep_mask(crop.shape, lm, bangs) > 0] = 0
     kwargs = dict(
         model=MODEL,
         image=[("customer.png", encode(crop), "image/png"), ("wig.png", encode(wig_rgb), "image/png")],
@@ -335,9 +351,10 @@ async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
     # 3. The result is ALWAYS the customer's own photo. Outside the fenced zone nothing from the AI
     #    is used at all (no model needed for that). Inside it, the hair model (when available)
     #    keeps only the new hair, so the clothes under and between the braids are theirs too.
-    seg_src = seg_out = None
+    seg_out = None
     try:
-        seg_src, seg_out = await segment(crop), await segment(out)
+        if seg_src is not None:
+            seg_out = await segment(out)
         if seg_out is not None and float(seg_out[..., HAIR].max()) < 0.5:
             seg_src = seg_out = None  # the model found no hair in the AI image
     except Exception:

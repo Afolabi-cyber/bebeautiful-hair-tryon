@@ -14,6 +14,30 @@ export default function Camera({ onBack, onCapture, error }) {
   const [useTimer, setUseTimer] = useState(true);
   const [count, setCount] = useState(0);
   const [flash, setFlash] = useState(false);
+  // Where the camera picture actually sits on screen (it is shown whole, not zoomed in),
+  // so the head guide can be drawn over the real frame.
+  const box = useRef(null);
+  const [frame, setFrame] = useState(null);
+
+  useEffect(() => {
+    const measure = () => {
+      const v = video.current, b = box.current;
+      if (!v || !b || !v.videoWidth) return;
+      const W = b.clientWidth, H = b.clientHeight, a = v.videoWidth / v.videoHeight;
+      // Fill the width; only zoom (cover) when the picture would otherwise be a thin strip.
+      let w = W, h = W / a;
+      if (h < H * 0.62) { h = H * 0.62; w = h * a; }
+      if (h > H) { h = H; w = h * a; }
+      setFrame({ w, h, left: (W - w) / 2, top: Math.max(0, (H - h) / 2 - H * 0.06) });
+    };
+    const ro = new ResizeObserver(measure);
+    if (box.current) ro.observe(box.current);
+    const v = video.current;
+    v?.addEventListener("loadedmetadata", measure);
+    v?.addEventListener("resize", measure);
+    measure();
+    return () => { ro.disconnect(); v?.removeEventListener("loadedmetadata", measure); v?.removeEventListener("resize", measure); };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -26,6 +50,12 @@ export default function Camera({ onBack, onCapture, error }) {
         });
         if (cancelled) return s.getTracks().forEach((t) => t.stop());
         stream.current = s;
+        // Widest view the front camera offers (some phones start zoomed in).
+        try {
+          const t = s.getVideoTracks()[0];
+          const z = t.getCapabilities?.().zoom;
+          if (z && z.min < (t.getSettings().zoom ?? z.min)) await t.applyConstraints({ advanced: [{ zoom: z.min }] });
+        } catch { /* not supported: fine */ }
         video.current.srcObject = s;
         await video.current.play();
         setDenied(false);
@@ -75,25 +105,32 @@ export default function Camera({ onBack, onCapture, error }) {
 
   return (
     <div className="relative h-full bg-black text-white overflow-hidden">
-      <video
-        ref={video}
-        playsInline
-        muted
-        className={`absolute inset-0 size-full object-cover ${facing === "user" ? "-scale-x-100" : ""}`}
-      />
+      <div ref={box} className="absolute inset-0">
+        <video
+          ref={video}
+          playsInline
+          muted
+          style={frame ? { width: frame.w, height: frame.h, left: frame.left, top: frame.top } : undefined}
+          className={`absolute object-cover ${frame ? "" : "inset-0 size-full"} ${facing === "user" ? "-scale-x-100" : ""}`}
+        />
 
-      {/* Face guide: darken everything outside an oval */}
-      <svg className="absolute inset-0 size-full pointer-events-none" viewBox="0 0 100 100" preserveAspectRatio="none">
-        <defs>
-          <mask id="oval">
-            <rect width="100" height="100" fill="white" />
-            <ellipse cx="50" cy="40" rx="27" ry="23" fill="black" />
-          </mask>
-        </defs>
-        <rect width="100" height="100" fill="rgba(20,12,8,.55)" mask="url(#oval)" />
-        <ellipse cx="50" cy="40" rx="27" ry="23" fill="none" stroke="white" strokeOpacity=".85"
-          strokeWidth=".5" strokeDasharray="1.6 1.2" vectorEffect="non-scaling-stroke" />
-      </svg>
+        {/* Head guide: a big, forgiving outline over the real camera picture; everything else is dimmed */}
+        {frame && (
+          <div
+            className="pointer-events-none absolute rounded-[50%] border-2 border-dashed border-white/85 transition-all"
+            style={(() => {
+              const w = Math.min(frame.w * 0.7, frame.h * 0.5);
+              const h = w * 1.32;
+              return {
+                width: w, height: h,
+                left: frame.left + (frame.w - w) / 2,
+                top: frame.top + frame.h * 0.43 - h / 2,
+                boxShadow: "0 0 0 200vmax rgba(20,12,8,.5)",
+              };
+            })()}
+          />
+        )}
+      </div>
 
       {/* Top bar */}
       <div className="absolute inset-x-0 top-0 safe-top px-4 flex items-center justify-between">
@@ -106,9 +143,9 @@ export default function Camera({ onBack, onCapture, error }) {
       </div>
 
       {/* Tips */}
-      <div className="absolute inset-x-0 top-[68%] px-6 text-center">
-        <p className="font-display text-2xl">Fit your face in the oval</p>
-        <p className="mt-1 text-sm text-white/80">Look straight ahead · good light · hair pulled back if you can</p>
+      <div className="absolute inset-x-0 bottom-32 safe-bottom px-6 text-center">
+        <p className="font-display text-2xl">Your head in the outline</p>
+        <p className="mt-1 text-sm text-white/80">It doesn't have to be exact. Hold the phone at arm's length so the top of your head shows, look straight ahead, good light.</p>
         {error && <p className="mx-auto mt-3 max-w-xs rounded-2xl bg-red-500/90 px-4 py-2 text-sm">{error}</p>}
       </div>
 
