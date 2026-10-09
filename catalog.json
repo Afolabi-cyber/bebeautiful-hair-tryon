@@ -1,0 +1,70 @@
+{
+  "brand": {
+    "name": "Be Beautiful Hair",
+    "tagline": "Own your Look!",
+    "accent": "#ED008C",
+    "website": "https://bebeautifulhair.com"
+  },
+  "products": [
+    {
+      "id": "burgundy-copper-boho",
+      "name": "Burgundy Copper Boho",
+      "price": "",
+      "image": "wigs/burgundy-copper-boho.png",
+      "thumb": "wigs/thumbs/burgundy-copper-boho.webp",
+      "description": "boho knotless braids wig, middle part, small braids from the scalp that turn into deep water curls from shoulder level down, colour ombre from dark brown roots through burgundy red to copper ginger ends, waist length, very full",
+      "bangs": false,
+      "buyUrl": "https://bebeautifulhair.com/collections/braids"
+    },
+    {
+      "id": "chestnut-side-part-boho",
+      "name": "Chestnut Side-Part Boho",
+      "price": "",
+      "image": "wigs/chestnut-side-part-boho.png",
+      "thumb": "wigs/thumbs/chestnut-side-part-boho.webp",
+      "description": "boho knotless braids wig with a deep side part, small chestnut brown braids with golden brown highlights swept to one side, loose bouncy curls at the ends, waist length",
+      "bangs": false,
+      "buyUrl": "https://bebeautifulhair.com/collections/braids"
+    },
+    {
+      "id": "honey-ombre-goddess",
+      "name": "Honey Ombre Goddess",
+      "price": "",
+      "image": "wigs/honey-ombre-goddess.png",
+      "thumb": "wigs/thumbs/honey-ombre-goddess.webp",
+      "description": "extra long goddess braids wig, cornrows at the crown on one side, loose wavy curls throughout with a few thin braids mixed in, ombre from dark brown roots to copper to light honey blonde ends, hip length",
+      "bangs": false,
+      "buyUrl": "https://bebeautifulhair.com/collections/braids"
+    },
+    {
+      "id": "auburn-curly-boho",
+      "name": "Auburn Curly Boho",
+      "price": "",
+      "image": "wigs/auburn-curly-boho.png",
+      "thumb": "wigs/thumbs/auburn-curly-boho.webp",
+      "description": "boho braids wig, middle part, thin braids from the scalp mostly hidden under very full curly hair, rich dark auburn chocolate brown colour all over, extra long to the hips, voluminous",
+      "bangs": false,
+      "buyUrl": "https://bebeautifulhair.com/collections/braids"
+    },
+    {
+      "id": "honey-blonde-boho",
+      "name": "Honey Blonde Boho",
+      "price": "",
+      "image": "wigs/honey-blonde-boho.png",
+      "thumb": "wigs/thumbs/honey-blonde-boho.webp",
+      "description": "boho knotless braids wig, middle part, braids with dark roots and honey blonde lengths that open into springy honey blonde water curls from the chest down, waist length, full",
+      "bangs": false,
+      "buyUrl": "https://bebeautifulhair.com/collections/braids"
+    },
+    {
+      "id": "ombre-knotless-box",
+      "name": "Ombre Knotless Box Braids",
+      "price": "",
+      "image": "wigs/ombre-knotless-box.png",
+      "thumb": "wigs/thumbs/ombre-knotless-box.webp",
+      "description": "long straight knotless box braids wig, middle part, many small neat braids, ombre from black-brown roots to golden caramel brown, wispy unbraided ends, extra long past the hips",
+      "bangs": false,
+      "buyUrl": "https://bebeautifulhair.com/collections/braids"
+    }
+  ]
+}

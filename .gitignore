@@ -1,0 +1,11 @@
+.env
+server/data/
+server/models/
+frontend/node_modules/
+__pycache__/
+
+*.zip
+**/__pycache__/
+server/data/
+server/models/
+.env

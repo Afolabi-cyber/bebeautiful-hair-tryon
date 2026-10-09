@@ -1,0 +1,38 @@
+# Render Blueprint: New > Blueprint > pick this repo. Creates the paid, always-on web service.
+services:
+  - type: web
+    name: bebeautiful-hair-tryon
+    runtime: docker
+    plan: 1c-2g            # Standard: 1 CPU, 2 GB RAM, always on (no spin-down, no cold starts)
+    region: frankfurt      # closest Render region to Nigeria
+    healthCheckPath: /api/health
+    autoDeploy: true
+    disk:                  # keeps customers, photos, uploaded wigs and admin edits across deploys
+      name: data
+      mountPath: /var/data
+      sizeGB: 5
+    envVars:
+      - key: DATA_DIR
+        value: /var/data
+      - key: OPENAI_API_KEY
+        sync: false          # you paste it in the Render dashboard
+      - key: ADMIN_PASSWORD
+        sync: false          # you choose it in the Render dashboard
+      - key: SECRET_KEY
+        generateValue: true
+      - key: OPENAI_IMAGE_MODEL
+        value: gpt-image-1.5
+      - key: OPENAI_IMAGE_QUALITY
+        value: high
+      - key: RESULT_BACKGROUND
+        value: studio
+      - key: FACE_ENHANCE
+        value: "0.75"
+      - key: MAX_TRYONS_PER_PERSON
+        value: "10"
+      - key: PHOTOS_PER_IP_PER_HOUR
+        value: "15"
+      - key: TRYONS_PER_IP_PER_HOUR
+        value: "30"
+      - key: ALLOW_WITHOUT_HAIR_MODEL
+        value: "off"

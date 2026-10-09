@@ -1,0 +1,10 @@
+# Exact versions tested together (Python 3.12). Upgrade deliberately, then re-test.
+fastapi==0.143.0
+uvicorn[standard]==0.54.0
+python-multipart==0.0.32
+python-dotenv==1.2.4
+openai==3.27.0
+mediapipe==1.1.0
+opencv-python-headless==5.0.0.93
+numpy==2.5.3
+pillow==12.3.0

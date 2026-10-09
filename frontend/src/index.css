@@ -1,0 +1,43 @@
+@import "tailwindcss";
+
+@theme {
+  /* Be Beautiful Hair, taken from bebeautifulhair.com:
+     Reem Kufi for text and headings, Young Serif for marketing headlines,
+     white and #222 with light grey panels, pink #ED008C accents, blue #408BB3 headline accent. */
+  --font-display: "Young Serif", Georgia, serif;
+  --font-sans: "Reem Kufi", system-ui, sans-serif;
+  --color-cream: #FFFFFF;
+  --color-sand: #F3F3F3;
+  --color-blush: #FDE6F2;
+  --color-espresso: #222222;
+  --color-cocoa: #666666;
+  --color-brand: #ED008C;
+  --color-brand-dark: #C40074;
+  --color-gold: #EF448C;
+  --color-sky: #408BB3;
+  --shadow-soft: 0 10px 30px -14px rgb(34 34 34 / 0.22);
+  --shadow-lift: 0 20px 50px -22px rgb(237 0 140 / 0.35);
+}
+
+/* Young Serif ships one weight and no italic: never let the browser fake bold or slanted versions. */
+.font-display { font-weight: 400 !important; font-style: normal !important; font-synthesis: none; }
+
+html, body, #root { height: 100%; }
+body {
+  @apply bg-cream text-espresso font-sans antialiased;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: none;
+}
+.safe-top { padding-top: max(env(safe-area-inset-top), 12px); }
+.safe-bottom { padding-bottom: max(env(safe-area-inset-bottom), 16px); }
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { scrollbar-width: none; }
+
+@keyframes scan { 0% { top: -10%; } 100% { top: 105%; } }
+.scan-line { animation: scan 2.4s cubic-bezier(.45,.05,.55,.95) infinite alternate; }
+@keyframes shimmer { 100% { transform: translateX(100%); } }
+.shimmer::after {
+  content: ""; position: absolute; inset: 0; transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgb(255 255 255 / .35), transparent);
+  animation: shimmer 1.8s infinite;
+}
