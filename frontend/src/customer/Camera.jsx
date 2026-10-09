@@ -28,6 +28,8 @@ export default function Camera({ onBack, onCapture, error }) {
       let w = W, h = W / a;
       if (h < H * 0.62) { h = H * 0.62; w = h * a; }
       if (h > H) { h = H; w = h * a; }
+      // Never wider than the screen: a wide (landscape) camera is cropped at the sides instead.
+      w = Math.min(w, W);
       setFrame({ w, h, left: (W - w) / 2, top: Math.max(0, (H - h) / 2 - H * 0.06) });
     };
     const ro = new ResizeObserver(measure);
@@ -111,7 +113,7 @@ export default function Camera({ onBack, onCapture, error }) {
           playsInline
           muted
           style={frame ? { width: frame.w, height: frame.h, left: frame.left, top: frame.top } : undefined}
-          className={`absolute object-cover ${frame ? "" : "inset-0 size-full"} ${facing === "user" ? "-scale-x-100" : ""}`}
+          className={`absolute max-w-none object-cover ${frame ? "" : "inset-0 size-full"} ${facing === "user" ? "-scale-x-100" : ""}`}
         />
 
         {/* Head guide: a big, forgiving outline over the real camera picture; everything else is dimmed */}
