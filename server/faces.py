@@ -203,6 +203,20 @@ def head_area(src_shape, src_lm: np.ndarray) -> np.ndarray:
     return m
 
 
+def ear_area(src_shape, src_lm: np.ndarray) -> np.ndarray:
+    """float 0/1: where the two ears sit, just outside the sides of the face."""
+    H, W = src_shape[:2]
+    g = geom(src_lm)
+    side = src_lm[454] - src_lm[234]
+    side = side / max(float(np.linalg.norm(side)), 1e-6)
+    ang = float(np.degrees(np.arctan2(side[1], side[0])))
+    m = np.zeros((H, W), np.float32)
+    for idx, sgn in ((234, -1), (454, 1)):
+        c = src_lm[idx] + sgn * side * 0.06 * g.width - g.up * 0.03 * g.height
+        cv2.ellipse(m, tuple(np.round(c).astype(int)), (int(0.11 * g.width), int(0.19 * g.height)), ang, 0, 360, 1.0, -1)
+    return m
+
+
 def transfer_hair(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.ndarray | None,
                   zone: np.ndarray, seg_src: np.ndarray | None = None, seg_out: np.ndarray | None = None,
                   enhance: float = 0.75, background: str = "studio") -> np.ndarray:
@@ -254,8 +268,19 @@ def transfer_hair(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: 
     # Their old hair that the wig doesn't cover (e.g. an afro sticking out at the sides) is filled
     # in from the surrounding background so it doesn't show next to the wig.
     # (all old hair is cleared, also under the wig, so the fill borrows from background, not hair)
+    # The customer's ears: skin-coloured pixels in the ear areas. The hair model sometimes calls an ear
+    # "hair" (next to short dark hair), so without this the ear would be cleared away with the old hair.
+    face_in = keep_mask(src.shape, src_lm) > 0
+    lab_src = cv2.cvtColor(base, cv2.COLOR_RGB2LAB).astype(np.float32)
+    skin_ref = lab_src[face_in].mean(axis=0) if face_in.any() else lab_src.reshape(-1, 3).mean(axis=0)
+    skin_like = np.clip((40 - np.linalg.norm(lab_src - skin_ref, axis=-1)) / 15, 0, 1)
+    bg_src = seg_src[..., BG] if seg_src is not None else np.zeros((H, W), np.float32)
+    ears = ear_area(src.shape, src_lm) * skin_like * np.clip((0.7 - bg_src) / 0.4, 0, 1)
+    ears = cv2.GaussianBlur(cv2.morphologyEx(ears, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)), (0, 0), 1.0)
+
     old = (seg_src[..., HAIR] > 0.4).astype(np.uint8) * 255 if seg_src is not None else np.zeros((H, W), np.uint8)
     old[_poly_mask(src.shape, src_lm[FACE_OVAL]) > 0.5] = 0  # never touch the face
+    old[ears > 0.3] = 0                                      # or the ears
     if old.any():
         old = cv2.dilate(old, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * max(2, int(0.008 * W)) + 1,) * 2))
         base = cv2.inpaint(base, old, max(3, int(0.012 * W)), cv2.INPAINT_TELEA)
@@ -272,7 +297,18 @@ def transfer_hair(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: 
     hair_src = cv2.dilate(hair_src, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * max(2, int(0.01 * W)) + 1,) * 2))
     not_bg_out = 1 - np.clip(to_src(np.ascontiguousarray(seg_out[..., BG])), 0, 1)
     flush = head * np.maximum(hair_src, p) * np.clip((not_bg_out - 0.3) / 0.4, 0, 1)
+    flush = flush * (1 - ears)  # on the ears only the AI's actual hair is used (a wig falling over them)
     a = np.maximum(a, cv2.GaussianBlur(flush, (0, 0), 1.0))
+
+    # Any AI skin used at the hairline/temples is matched to the customer's own skin tone, so the
+    # top of the forehead doesn't come out greyer or lighter than the rest of the face.
+    skin_out = np.clip(to_src(np.ascontiguousarray(seg_out[..., FACE_SKIN] + seg_out[..., BODY_SKIN])), 0, 1)
+    both = face_in & (skin_out > 0.5)
+    if both.sum() > 200:
+        lab_out = cv2.cvtColor(np.clip(out_s, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+        shift = lab_src[both].mean(axis=0) - lab_out[both].mean(axis=0)
+        fixed = cv2.cvtColor(np.clip(lab_out + shift, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB).astype(np.float32)
+        out_s = out_s * (1 - skin_out[..., None]) + fixed * skin_out[..., None]
 
     final = base.astype(np.float32) * (1 - a[..., None]) + out_s * a[..., None]
 
@@ -283,6 +319,7 @@ def transfer_hair(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: 
         person = np.clip(1 - seg_src[..., BG] - seg_src[..., HAIR], 0, 1)
         person = np.maximum(person, _poly_mask(src.shape, src_lm[FACE_OVAL]))  # the face is always kept
         person = np.clip((person - 0.3) / 0.4, 0, 1)                          # crisper edge, no room halo
+        person = np.maximum(person, ears)                                      # and so are the ears
         person = cv2.GaussianBlur(person, (0, 0), 1.0)
         alpha = np.maximum(person, a)[..., None]
         final = final * alpha + backdrop(H, W, background) * (1 - alpha)
