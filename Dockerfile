@@ -24,10 +24,12 @@ COPY server/ server/
 COPY wigs/ wigs/
 COPY catalog.json ./
 COPY --from=web /web/dist frontend/dist
-# Bake both AI models into the image so nothing downloads while customers wait,
-# then load them once: if a system library is missing, the BUILD fails here
-# (with a clear error) instead of the live server failing its health checks.
-RUN cd server && python download_models.py && python -c "import faces; faces.FaceTool(); faces.Segmenter(); print('models load OK')"
+# Bake both AI models into the image so nothing downloads while customers wait.
+# They are NOT loaded here: MediaPipe's memory allocator (tcmalloc) aborts inside
+# Render's build sandbox because it can't read the CPU count there. The models are
+# loaded at startup on the real instance (see "MODEL CHECK" in the logs), and
+# /api/health fails if the face model can't load, so a bad deploy never goes live.
+RUN cd server && python download_models.py
 WORKDIR /app/server
 EXPOSE 10000
 # One worker: the models, rate limits and caches live in this process.

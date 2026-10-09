@@ -77,7 +77,7 @@ The repo includes `Dockerfile` and `render.yaml`. The blueprint creates:
 - a 5 GB persistent disk at `/var/data` for the database, customer photos, uploaded wigs and admin edits. On first boot the six starting wigs are copied there.
 - region Frankfurt (closest to Nigeria), health check `/api/health`, auto-deploy on every push.
 
-Both AI models are downloaded while the image builds, so a deploy fails loudly (and the previous version stays live) instead of starting without them.
+Both AI models are downloaded while the image builds, so nothing downloads while customers wait. They are loaded when the server starts; if the face model can't load, `/api/health` fails, so Render keeps the previous version live instead of switching to a broken one.
 
 Steps:
 1. Push this folder to a private GitHub repository (`.env`, `server/data` and `node_modules` are git-ignored).
