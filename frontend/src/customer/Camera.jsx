@@ -147,7 +147,7 @@ export default function Camera({ onBack, onCapture, error }) {
       {/* Tips */}
       <div className="absolute inset-x-0 bottom-32 safe-bottom px-6 text-center">
         <p className="font-display text-2xl">Your head in the outline</p>
-        <p className="mt-1 text-sm text-white/80">It doesn't have to be exact. Hold the phone at arm's length so the top of your head shows, look straight ahead, good light.</p>
+        <p className="mt-1 text-sm text-white/80">It doesn't have to be exact. Hold the phone at arm's length so the top of your head shows, look straight ahead, good light. If you can, pull your hair or fringe back off your face.</p>
         {error && <p className="mx-auto mt-3 max-w-xs rounded-2xl bg-red-500/90 px-4 py-2 text-sm">{error}</p>}
       </div>
 

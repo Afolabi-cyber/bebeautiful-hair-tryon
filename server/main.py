@@ -23,7 +23,7 @@ import catalog_store
 import db
 from status import STATUS
 from admin import router as admin_router
-from faces import HAIR, FaceTool, Segmenter, hair_zone, head_crop, keep_mask, openai_mask_png, transfer_hair, wig_shape
+from faces import HAIR, FaceTool, Segmenter, hair_zone, head_crop, keep_mask, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -138,7 +138,7 @@ def build_prompt(p: dict) -> str:
         "Do not invent a different hairstyle and do not change the wig's colours. Seat the wig "
         "flush and snug on the customer's head like a professionally installed wig: it hugs the scalp "
         "and the shape of the skull at the crown and sides, with no gap, lift or space between the wig "
-        "and the head, no visible cap, lace or edges, and the wig's hairline blends naturally into the "
+        "and the head, the top of the wig lying close to the scalp (not puffed up or floating above the head), no visible cap, lace or edges, and the wig's hairline blends naturally into the "
         "skin of their forehead and temples. Hide all of their own hair underneath it so none of it "
         "shows at the hairline, temples, sides or neck. The hair hangs down in front of both ears and covers them, the same on the left and the right side, so neither ear shows. Let the hair fall over the shoulders and down the body as long as the wig "
         "is, and match the camera angle of image 1. Use soft, even, flattering light on the face and hair, "
@@ -243,8 +243,13 @@ async def create_session(
     k = min(1.0, 1800 / max(rgb.shape[:2]))
     if k < 1:
         rgb = cv2.resize(rgb, None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
-    if await landmarks(rgb) is None:
+    async with _face_lock_guard:
+        lm0, blink = await asyncio.to_thread(faces().detect, rgb)
+    if lm0 is None:
         raise HTTPException(422, "We couldn't find a face. Face the camera in good light and try again.")
+    problem = photo_problem(rgb.shape, lm0, blink)
+    if problem:
+        raise HTTPException(422, problem)
 
     photo = db.save_photo(encode(rgb, ".jpg", 94))
     sid = db.create_session(name, phone or None, email or None, True, photo,
@@ -317,11 +322,11 @@ async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
         log.exception("Hair model failed on this photo")
         seg_src = None
     if seg_src is not None:
-        old_hair = (seg_src[..., HAIR] > 0.35).astype(np.uint8)
+        own = (old_hair(seg_src, lm) > 0.35).astype(np.uint8)  # her hair, or a wrap/cap/wig she wears
         g = max(3, int(0.03 * OUT_W))
-        old_hair = cv2.dilate(old_hair, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * g + 1, 2 * g + 1)))
-        zone = np.maximum(zone, old_hair)
-        zone[keep_mask(crop.shape, lm, bangs) > 0] = 0
+        own = cv2.dilate(own, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * g + 1, 2 * g + 1)))
+        zone = np.maximum(zone, own)
+        zone[skin_lock(seg_src, lm, bangs) > 0] = 0  # her real forehead/temples: the wig is built around them
     kwargs = dict(
         model=MODEL,
         image=[("customer.png", encode(crop), "image/png"), ("wig.png", encode(wig_rgb), "image/png")],
