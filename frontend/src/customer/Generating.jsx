@@ -12,7 +12,7 @@ const LINES = [
   "Almost there",
 ];
 const TIPS = [
-  "You can try more styles after this one, on the same photo.",
+  "Not happy with the photo? You can take a new one after this.",
   "Drag the slider on your result to compare before and after.",
   "Save your look or share it with friends straight from the result.",
   "Love it? Tap Shop this look to order this wig.",
