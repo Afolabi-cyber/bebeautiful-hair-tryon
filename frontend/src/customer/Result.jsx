@@ -1,7 +1,7 @@
-import { ArrowLeft, Download, Share2, ShoppingBag, Sparkles, ShieldCheck, RotateCcw } from "lucide-react";
-import { Button, CompareSlider, IconButton } from "../ui/ui.jsx";
+import { Camera, Download, Share2, ShoppingBag, ShieldCheck, RotateCcw } from "lucide-react";
+import { Button, CompareSlider } from "../ui/ui.jsx";
 
-export default function Result({ looks, active, setActive, product, onTryAnother, onStartAgain }) {
+export default function Result({ looks, active, setActive, product, onNewPhoto, onStartAgain }) {
   const look = looks[active];
   const p = product(look.wigId) || { name: "Your look" };
   const fileName = `my-${look.wigId}.jpg`;
@@ -27,11 +27,8 @@ export default function Result({ looks, active, setActive, product, onTryAnother
   return (
     <div className="flex h-full flex-col">
       <header className="safe-top flex items-center gap-2 px-4 pb-2">
-        <IconButton label="Back to styles" onClick={onTryAnother} className="bg-white ring-1 ring-espresso/10">
-          <ArrowLeft className="size-5" />
-        </IconButton>
         <div className="min-w-0 flex-1 px-1">
-          <p className="text-xs font-semibold uppercase tracking-wider text-brand">Step 4 of 4 · Your look</p>
+          <p className="text-xs font-semibold uppercase tracking-wider text-brand">Step 3 of 3 · Your look</p>
           <h1 className="truncate font-display text-xl leading-tight">{p.name}</h1>
         </div>
       </header>
@@ -81,8 +78,8 @@ export default function Result({ looks, active, setActive, product, onTryAnother
           </Button>
         )}
         <div className="grid grid-cols-2 gap-2.5">
-          <Button variant={p.buyUrl ? "dark" : "primary"} onClick={onTryAnother} className="h-12">
-            <Sparkles className="size-4" /> Another style
+          <Button variant={p.buyUrl ? "dark" : "primary"} onClick={onNewPhoto} className="h-12">
+            <Camera className="size-4" /> New photo
           </Button>
           <Button variant="soft" onClick={onStartAgain} className="h-12">
             <RotateCcw className="size-4" /> Start again

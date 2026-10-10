@@ -4,13 +4,13 @@ import { api } from "../api.js";
 import Welcome from "./Welcome.jsx";
 import Camera from "./Camera.jsx";
 import Review from "./Review.jsx";
-import WigPicker from "./WigPicker.jsx";
 import Generating from "./Generating.jsx";
 import Result from "./Result.jsx";
 
-// One straight path for every visitor: details -> photo -> style -> result.
-const STEP = { welcome: 0, camera: 1, review: 1, wigs: 2, generating: 3, result: 3 };
-const BACK = { camera: "welcome", review: "camera", wigs: "camera", result: "wigs" };
+// Customers arrive from a product page on the website (?wig=...), so the style is already chosen.
+// One straight path: details -> photo -> your look.
+const STEP = { welcome: 0, camera: 1, review: 1, generating: 2, failed: 2, result: 2 };
+const BACK = { camera: "welcome", review: "camera" };
 
 // Only name and phone are remembered on this phone (to prefill the form next time).
 // Photos and results are never restored: every visit starts fresh.
@@ -40,7 +40,8 @@ export default function CustomerApp() {
   const [active, setActive] = useState(0);
   const [screen, setScreen] = useState("welcome");
   const [error, setError] = useState("");
-  const [preset, setPreset] = useState(null); // wig chosen on the product page, if any
+  const [preset, setPreset] = useState(null); // wig chosen on the product page
+  const [loaded, setLoaded] = useState(false); // catalogue loaded
   const screenRef = useRef(screen);
   screenRef.current = screen;
 
@@ -54,6 +55,7 @@ export default function CustomerApp() {
         const hit = (c.products || []).find((p) => p.id === LINKED || handleOf(p.buyUrl) === LINKED);
         if (hit) setPreset(hit.id);
       }
+      setLoaded(true);
     }).catch(() => setError("Couldn't load styles. Check your connection."));
   }, []);
 
@@ -65,7 +67,7 @@ export default function CustomerApp() {
     const onPop = () => {
       const target = BACK[screenRef.current];
       if (screenRef.current === "generating") window.history.pushState({}, ""); // stay while working
-      else if (target) setScreen(target === "wigs" && !sessionId ? "camera" : target);
+      else if (target) setScreen(target);
     };
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
@@ -92,9 +94,7 @@ export default function CustomerApp() {
       setWigId(preset);
       tryOn(preset, res.sessionId, []);
     } else {
-      setWigId(null);
-      setScreen("wigs");
-      if (LINKED) setError("That style isn't available for try-on yet. Pick one of these instead.");
+      setScreen("welcome"); // no style chosen: the welcome screen explains how to start from the shop
     }
   }
 
@@ -112,14 +112,14 @@ export default function CustomerApp() {
       setActive(0);
       setScreen("result");
     } catch (e) {
-      if (e.status === 404) { setSessionId(null); setScreen("camera"); }
-      else setScreen("wigs");
       setError(e.message);
+      if (e.status === 404) { setSessionId(null); setScreen("camera"); }
+      else setScreen("failed");
     }
   }
 
   const views = {
-    welcome: (
+    welcome: loaded && !preset ? <NoStyle brand={brand} unknown={!!LINKED} /> : (
       <Welcome
         brand={brand}
         products={products}
@@ -138,29 +138,21 @@ export default function CustomerApp() {
     review: draft && (
       <Review url={draft.url} name={customer?.name} onRetake={() => setScreen("camera")} onConfirm={confirmPhoto} />
     ),
-    wigs: (
-      <WigPicker
-        brand={brand}
-        customer={customer}
-        selfie={selfie}
-        products={products}
-        selected={wigId}
-        tried={new Set(looks.map((l) => l.wigId))}
-        onSelect={setWigId}
-        onTry={() => tryOn()}
-        onRetake={() => setScreen("camera")}
-        onShowLooks={looks.length ? () => setScreen("result") : null}
-        error={error}
+    generating: <Generating selfie={selfie} wig={product(wigId)} />,
+    failed: (
+      <Failed
+        message={error}
+        onRetry={() => tryOn(wigId)}
+        onNewPhoto={() => { setError(""); setScreen("camera"); }}
       />
     ),
-    generating: <Generating selfie={selfie} wig={product(wigId)} />,
     result: looks[active] && (
       <Result
         looks={looks}
         active={active}
         setActive={setActive}
         product={product}
-        onTryAnother={() => setScreen("wigs")}
+        onNewPhoto={() => { setError(""); setScreen("camera"); }}
         onStartAgain={startAgain}
       />
     ),
@@ -185,15 +177,50 @@ export default function CustomerApp() {
   );
 }
 
-/** Four thin segments along the top: details, photo, style, your look. */
+/** Three thin segments along the top: details, photo, your look. */
 function Progress({ step, dark }) {
   return (
     <div className="pointer-events-none absolute inset-x-0 top-0 z-30 flex gap-1.5 px-4 pt-[max(env(safe-area-inset-top),4px)]">
-      {[0, 1, 2, 3].map((i) => (
+      {[0, 1, 2].map((i) => (
         <div key={i} className={`h-[3px] flex-1 overflow-hidden rounded-full ${dark ? "bg-white/25" : "bg-espresso/10"}`}>
           <div className={`h-full rounded-full bg-brand transition-all duration-500 ${i <= step ? "w-full" : "w-0"}`} />
         </div>
       ))}
+    </div>
+  );
+}
+
+/** Opened without a product link (or with one for a style that isn't set up for try-on). */
+function NoStyle({ brand, unknown }) {
+  const shop = brand.website || "https://bebeautifulhair.com";
+  return (
+    <div className="flex h-full flex-col items-center justify-center px-8 text-center safe-top safe-bottom">
+      <img src="/logo.png" alt={brand.name || "Be Beautiful Hair"} className="size-16 rounded-full shadow-soft ring-2 ring-white" />
+      <h1 className="mt-6 font-display text-[30px] leading-tight">
+        {unknown ? "This style isn't ready for try-on yet" : <>Pick a style, then <span className="text-brand">try it on</span></>}
+      </h1>
+      <p className="mt-3 max-w-xs text-[15px] leading-relaxed text-cocoa">
+        {unknown
+          ? "Try-on isn't available for this style yet. Have a look at our other styles and tap Try it on where you see it."
+          : "Open any style on our website and tap Try it on to see it on your own photo."}
+      </p>
+      <a href={shop} className="mt-8 inline-flex h-14 items-center gap-2 rounded-full bg-brand px-8 text-base font-semibold text-cream shadow-soft active:bg-brand-dark">
+        Browse styles
+      </a>
+    </div>
+  );
+}
+
+/** The AI step failed (busy, network): try the same photo again or take a new one. */
+function Failed({ message, onRetry, onNewPhoto }) {
+  return (
+    <div className="flex h-full flex-col items-center justify-center px-8 text-center safe-top safe-bottom">
+      <h1 className="font-display text-[30px] leading-tight">That didn't work this time</h1>
+      <p className="mt-3 max-w-xs text-[15px] leading-relaxed text-cocoa">{message || "Something went wrong. Please try again."}</p>
+      <div className="mt-8 flex w-full max-w-xs flex-col gap-2.5">
+        <button onClick={onRetry} className="h-14 rounded-full bg-brand text-base font-semibold text-cream shadow-soft active:bg-brand-dark">Try again</button>
+        <button onClick={onNewPhoto} className="h-12 rounded-full bg-white text-sm font-semibold ring-1 ring-espresso/10 active:bg-sand">Take a new photo</button>
+      </div>
     </div>
   );
 }

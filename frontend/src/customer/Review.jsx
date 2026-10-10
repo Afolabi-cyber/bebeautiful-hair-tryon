@@ -20,7 +20,7 @@ export default function Review({ url, name, onRetake, onConfirm }) {
   return (
     <div className="flex h-full flex-col safe-top">
       <div className="px-6 pt-2">
-        <p className="text-sm font-semibold text-brand">Step 2 of 4 · Your photo</p>
+        <p className="text-sm font-semibold text-brand">Step 2 of 3 · Your photo</p>
         <h1 className="font-display text-3xl tracking-tight">Looking good{name ? `, ${name.split(" ")[0]}` : ""}</h1>
         <p className="text-cocoa text-sm mt-1">Is your face clear and well lit? This is the photo we'll style.</p>
       </div>
