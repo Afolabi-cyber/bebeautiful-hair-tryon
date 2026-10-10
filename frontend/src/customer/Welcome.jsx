@@ -3,7 +3,7 @@ import { motion } from "motion/react";
 import { ShieldCheck, ArrowRight } from "lucide-react";
 import { Button } from "../ui/ui.jsx";
 
-export default function Welcome({ brand, products, initial, onContinue }) {
+export default function Welcome({ brand, products, preset, initial, onContinue }) {
   const [name, setName] = useState(initial?.name || "");
   const [phone, setPhone] = useState(initial?.phone || "");
   const [consent, setConsent] = useState(false);
@@ -12,7 +12,9 @@ export default function Welcome({ brand, products, initial, onContinue }) {
   const nameOk = name.trim().length >= 2;
   const phoneOk = phone.replace(/\D/g, "").length >= 7;
   const ready = nameOk && phoneOk && consent;
-  const shots = products.slice(0, 3);
+  // From a product page, that wig takes the centre spot.
+  const others = products.filter((p) => p.id !== preset?.id);
+  const shots = preset ? [others[0], preset, others[1]].filter(Boolean) : products.slice(0, 3);
 
   function submit(e) {
     e.preventDefault();
@@ -52,7 +54,9 @@ export default function Welcome({ brand, products, initial, onContinue }) {
           Own your <span className="text-brand">look!</span>
         </h1>
         <p className="mt-2.5 text-[15px] leading-relaxed text-cocoa">
-          Try our styles on your own photo before you buy. It takes about a minute.
+          {preset
+            ? <>See yourself in the <span className="font-semibold text-espresso">{preset.name}</span> on your own photo before you buy. It takes about a minute.</>
+            : "Try our styles on your own photo before you buy. It takes about a minute."}
         </p>
 
         <div className="mt-6 space-y-3">

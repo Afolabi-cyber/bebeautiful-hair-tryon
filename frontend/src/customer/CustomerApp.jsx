@@ -18,6 +18,16 @@ const DETAILS = "bbh-tryon-details";
 const loadDetails = () => { try { return JSON.parse(localStorage.getItem(DETAILS)); } catch { return null; } };
 const saveDetails = (d) => { try { localStorage.setItem(DETAILS, JSON.stringify(d)); } catch { /* blocked */ } };
 
+// A link from a product page on the website: ?wig=<product handle or wig id>.
+// It matches the wig's id, or the product address set as its "Shop link" in the admin.
+const LINKED = (() => {
+  try { return (new URLSearchParams(window.location.search).get("wig") || "").trim().toLowerCase(); } catch { return ""; }
+})();
+const handleOf = (url) => {
+  const m = /\/products\/([^/?#]+)/.exec(url || "");
+  return m ? decodeURIComponent(m[1]).toLowerCase() : "";
+};
+
 export default function CustomerApp() {
   const [brand, setBrand] = useState({ name: "Be Beautiful Hair" });
   const [products, setProducts] = useState([]);
@@ -30,6 +40,7 @@ export default function CustomerApp() {
   const [active, setActive] = useState(0);
   const [screen, setScreen] = useState("welcome");
   const [error, setError] = useState("");
+  const [preset, setPreset] = useState(null); // wig chosen on the product page, if any
   const screenRef = useRef(screen);
   screenRef.current = screen;
 
@@ -39,6 +50,10 @@ export default function CustomerApp() {
       setProducts(c.products || []);
       if (c.brand?.accent) document.documentElement.style.setProperty("--color-brand", c.brand.accent);
       if (c.brand?.name) document.title = `${c.brand.name} · Virtual Try-On`;
+      if (LINKED) {
+        const hit = (c.products || []).find((p) => p.id === LINKED || handleOf(p.buyUrl) === LINKED);
+        if (hit) setPreset(hit.id);
+      }
     }).catch(() => setError("Couldn't load styles. Check your connection."));
   }, []);
 
@@ -71,20 +86,29 @@ export default function CustomerApp() {
     setSelfie(await blobToDataUrl(draft.blob));
     setSessionId(res.sessionId);
     setLooks([]);
-    setWigId(null);
     setDraft(null);
-    setScreen("wigs");
+    if (preset) {
+      // Came from a product page: the wig is already chosen, so start making the look straight away.
+      setWigId(preset);
+      tryOn(preset, res.sessionId, []);
+    } else {
+      setWigId(null);
+      setScreen("wigs");
+      if (LINKED) setError("That style isn't available for try-on yet. Pick one of these instead.");
+    }
   }
 
-  async function tryOn() {
-    const p = product(wigId);
-    const existing = looks.findIndex((l) => l.wigId === wigId);
+  async function tryOn(id = wigId, sid = sessionId, have = looks) {
+    const p = product(id);
+    if (!p) return;
+    const existing = have.findIndex((l) => l.wigId === id);
     if (existing >= 0) { setActive(existing); setScreen("result"); return; }
     setError("");
     setScreen("generating");
     try {
-      const r = await api.tryOn(sessionId, p.id);
-      setLooks([{ wigId: p.id, before: r.before, after: r.after, faceLocked: r.faceLocked }, ...looks]);
+      const r = await api.tryOn(sid, p.id);
+      readyAlert();
+      setLooks((prev) => [{ wigId: p.id, before: r.before, after: r.after, faceLocked: r.faceLocked }, ...prev]);
       setActive(0);
       setScreen("result");
     } catch (e) {
@@ -99,6 +123,7 @@ export default function CustomerApp() {
       <Welcome
         brand={brand}
         products={products}
+        preset={product(preset)}
         initial={customer}
         onContinue={(c) => { setCustomer(c); saveDetails(c); setError(""); setScreen("camera"); }}
       />
@@ -122,7 +147,7 @@ export default function CustomerApp() {
         selected={wigId}
         tried={new Set(looks.map((l) => l.wigId))}
         onSelect={setWigId}
-        onTry={tryOn}
+        onTry={() => tryOn()}
         onRetake={() => setScreen("camera")}
         onShowLooks={looks.length ? () => setScreen("result") : null}
         error={error}
@@ -171,6 +196,17 @@ function Progress({ step, dark }) {
       ))}
     </div>
   );
+}
+
+/** If she switched to another app while waiting: a short buzz and a tab title saying it's ready. */
+function readyAlert() {
+  try { navigator.vibrate?.(80); } catch { /* not supported */ }
+  if (document.hidden) {
+    const t = document.title;
+    document.title = "Your look is ready!";
+    const back = () => { document.title = t; document.removeEventListener("visibilitychange", back); };
+    document.addEventListener("visibilitychange", back);
+  }
 }
 
 function blobToDataUrl(blob) {

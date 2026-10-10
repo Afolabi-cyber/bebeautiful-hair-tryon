@@ -1,12 +1,33 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
-import { Plus, Pencil, Trash2, Eye, EyeOff, ArrowUp, ArrowDown, X, ImagePlus, AlertTriangle } from "lucide-react";
+import { Plus, Pencil, Trash2, Eye, EyeOff, ArrowUp, ArrowDown, X, ImagePlus, AlertTriangle, Link2, Check, Copy } from "lucide-react";
 import { adminApi } from "../api.js";
 import { Button, IconButton } from "../ui/ui.jsx";
 
 /** Admin: add, edit, hide, reorder and delete the wigs customers can try on. */
+// The try-on link for one wig: opens the try-on with that wig already chosen.
+// For the website's product pages (the web developer puts it behind a "Try it on" icon).
+// It uses the wig's id, which never changes, so links keep working after edits.
+export const tryOnLink = (w) => `${window.location.origin}/?wig=${encodeURIComponent(w.id)}`;
+
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch { /* fall back below */ }
+  try {
+    const t = document.createElement("textarea");
+    t.value = text; t.style.position = "fixed"; t.style.opacity = "0";
+    document.body.appendChild(t); t.select();
+    const ok = document.execCommand("copy"); t.remove(); return ok;
+  } catch { return false; }
+}
+
 export default function WigManager({ onError }) {
   const [items, setItems] = useState(null);
+  const [copied, setCopied] = useState(null); // wig id, or "all"
+  async function copy(key, text) {
+    if (await copyText(text)) { setCopied(key); setTimeout(() => setCopied((c) => (c === key ? null : c)), 1800); }
+    else onError?.({ message: "Couldn't copy. Select the link and copy it by hand." });
+  }
+  const allLinks = () => (items || []).filter((w) => w.active).map((w) => `${w.name}: ${tryOnLink(w)}`).join("\n");
   const [editing, setEditing] = useState(null); // null | "new" | wig object
   const [confirmDel, setConfirmDel] = useState(null);
   const [busyId, setBusyId] = useState(null);
@@ -36,8 +57,18 @@ export default function WigManager({ onError }) {
             {items ? `${items.filter((w) => w.active).length} live, ${items.filter((w) => !w.active).length} hidden` : "Loading…"}
           </p>
         </div>
-        <Button onClick={() => setEditing("new")}><Plus className="size-4" /> Add wig</Button>
+        <div className="flex flex-wrap gap-2">
+          <Button variant="soft" disabled={!items?.length} onClick={() => copy("all", allLinks())}>
+            {copied === "all" ? <Check className="size-4" /> : <Link2 className="size-4" />}
+            {copied === "all" ? "Copied" : "Copy all try-on links"}
+          </Button>
+          <Button onClick={() => setEditing("new")}><Plus className="size-4" /> Add wig</Button>
+        </div>
       </div>
+      <p className="mt-3 rounded-2xl bg-blush/60 px-4 py-3 text-[13px] leading-snug text-espresso/85">
+        <span className="font-semibold">Product page links:</span> each wig has its own try-on link. Put it behind the "Try it on"
+        icon on that product's page on the website. It opens the try-on with that wig already chosen.
+      </p>
 
       <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
         {items?.map((w, i) => (
@@ -49,6 +80,15 @@ export default function WigManager({ onError }) {
             <div className="p-3">
               <p className="truncate text-sm font-semibold">{w.name}</p>
               <p className="text-xs text-cocoa">{w.price || "No price"}</p>
+              <button
+                type="button"
+                onClick={() => copy(w.id, tryOnLink(w))}
+                title={tryOnLink(w)}
+                className="mt-2 flex w-full items-center gap-1.5 rounded-xl bg-sand px-2.5 py-1.5 text-left text-[11px] font-semibold text-espresso active:scale-[.98] transition"
+              >
+                {copied === w.id ? <Check className="size-3.5 shrink-0 text-brand" /> : <Copy className="size-3.5 shrink-0" />}
+                <span className="truncate">{copied === w.id ? "Link copied" : "Copy try-on link"}</span>
+              </button>
               <div className="mt-2.5 flex items-center justify-between">
                 <div className="flex">
                   <Small label="Move up" disabled={i === 0 || busyId} onClick={() => move(w, "up")}><ArrowUp className="size-4" /></Small>
