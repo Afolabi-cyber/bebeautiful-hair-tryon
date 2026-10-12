@@ -367,7 +367,8 @@ async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
     if seg_out is None and not ALLOW_WITHOUT_HAIR_MODEL:
         raise HTTPException(502, "We couldn't finish this look. Please try again.")
     try:
-        out_final = transfer_hair(crop, lm, out, out_lm, zone, seg_src, seg_out, FACE_ENHANCE, RESULT_BACKGROUND)
+        out_final = transfer_hair(crop, lm, out, out_lm, zone, seg_src, seg_out, FACE_ENHANCE, RESULT_BACKGROUND,
+                                  src_scale=w / OUT_W)
     except Exception:
         log.exception("Final composite failed")
         # Never fall back to the raw AI image (it may have changed the clothes).
