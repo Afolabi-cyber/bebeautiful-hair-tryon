@@ -492,6 +492,42 @@ def clothes_keep(seg_src: np.ndarray, src_lm: np.ndarray) -> np.ndarray:
     return c
 
 
+def _clone_face(src: np.ndarray, src_lm: np.ndarray, ai: np.ndarray, seg_src: np.ndarray, seg_ai: np.ndarray,
+                enhance: float) -> np.ndarray:
+    H, W = src.shape[:2]
+    g = geom(src_lm)
+    body = None
+    if seg_src is not None:
+        body = cv2.GaussianBlur(np.clip((seg_src[..., BODY_SKIN] - 0.3) / 0.4, 0, 1), (0, 0), max(2.0, 0.01 * W))
+    face = beautify(src, src_lm, enhance, skin_extra=body) if enhance > 0 else src
+    m = keep_mask(src.shape, src_lm, shrink=0.95)
+    hair_ai = (seg_ai[..., HAIR] > 0.5).astype(np.uint8)
+    hair_ai = cv2.dilate(hair_ai, np.ones((5, 5), np.uint8))
+    m[hair_ai > 0] = 0
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    pad = 3
+    m[:pad] = 0; m[-pad:] = 0; m[:, :pad] = 0; m[:, -pad:] = 0
+    if (m > 0).sum() < 0.2 * g.width * g.height:
+        return ai  # face mostly hidden or not found: leave the AI picture (the identity lock already ran)
+    ai_u8 = np.clip(ai, 0, 255).astype(np.uint8)
+    ys, xs = np.nonzero(m)
+    x0, x1, y0, y1 = xs.min(), xs.max(), ys.min(), ys.max()
+    center = (int((x0 + x1 + 1) // 2), int((y0 + y1 + 1) // 2))
+    soft = cv2.GaussianBlur((m > 0).astype(np.float32), (0, 0), max(1.5, 0.012 * g.width))
+    try:
+        # (a copy: OpenCV may change the mask it is given)
+        cloned = cv2.seamlessClone(face, ai_u8, m.copy(), center, cv2.NORMAL_CLONE).astype(np.float32)
+    except cv2.error:
+        cloned = None
+    if cloned is None:
+        # Fallback: colour-matched soft paste
+        k = m > 0
+        shift = ai[k].mean(0) - face[k].astype(np.float32).mean(0)
+        cloned = np.clip(face.astype(np.float32) + shift, 0, 255)
+    # soften the very edge of the clone region a little more
+    return ai * (1 - soft[..., None]) + cloned * soft[..., None]
+
+
 def _warp_field(H: int, W: int, src_pts: np.ndarray, dst_pts: np.ndarray, weight: np.ndarray, step: int = 8):
     """Smooth displacement field (inverse-distance weighted) so that a pixel at src_pts samples the
     picture at dst_pts. Returns float32 maps for cv2.remap, faded out where weight is 0."""
@@ -513,7 +549,7 @@ def _warp_field(H: int, W: int, src_pts: np.ndarray, dst_pts: np.ndarray, weight
 
 def compose_ai(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.ndarray | None,
                seg_src: np.ndarray, seg_out: np.ndarray, background: str = "studio",
-               src_scale: float = 1.0, detail: float = 0.6) -> np.ndarray | None:
+               src_scale: float = 1.0, detail: float = 0.6, enhance: float = 0.75) -> np.ndarray | None:
     """Natural blend: the AI renders the whole head (face, hairline, hair, light and shadows together,
     lightly beautified), then the face is put back into the customer's EXACT geometry and her real
     feature detail is restored, and her clothes always come from her own photo.
@@ -574,8 +610,14 @@ def compose_ai(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.
             lab_a += fix * w_sk[..., None]
             ai = cv2.cvtColor(np.clip(lab_a, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB).astype(np.float32)
 
-    # 2. Her real eyes, brows, nose and lips: put back their fine detail (not their colour or light),
-    #    so the AI's retouch keeps her recognisable features.
+    # 2. HER face, every time. The AI draws a slightly different face on every run, so the inner face
+    #    (brows down to the chin, cheek to cheek) always comes from her own photo, lightly retouched.
+    #    Poisson blending ("seamless clone") keeps all of her real facial detail but takes on the colour
+    #    and light of the AI picture at the edges, so it sits in the same light as the new hair with no seam.
+    #    Braids the AI drew falling over the cheeks stay in front.
+    ai = _clone_face(src, src_lm, ai, seg_src, seg_ai, enhance)
+
+    # Her real eyes, brows, nose and lips: put back their fine detail (not their colour or light).
     feats = np.zeros((H, W), np.float32)
     for ids, grow in ((LEFT_EYE, 0.05), (RIGHT_EYE, 0.05), (LEFT_BROW, 0.03), (RIGHT_BROW, 0.03),
                       (LIPS, 0.03), (NOSTRILS, 0.02)):
