@@ -410,8 +410,7 @@ async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
     out_final, mode = None, ""
     try:
         if ai_mode and seg_out is not None:
-            out_final = compose_ai(crop, lm, out, out_lm, seg_src, seg_out, RESULT_BACKGROUND, src_scale=w / OUT_W,
-                                   enhance=FACE_ENHANCE)
+            out_final = compose_ai(crop, lm, out, out_lm, seg_src, seg_out, RESULT_BACKGROUND, src_scale=w / OUT_W)
             mode = "ai blend"
         if out_final is None:
             # AI face couldn't be matched to her photo reliably: use her own face with the AI hair
