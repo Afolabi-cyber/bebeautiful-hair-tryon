@@ -168,7 +168,8 @@ def build_prompt_ai(p: dict) -> str:
         "density and volume. Do not invent a different hairstyle.\n"
         "The wig must look like it is really on her head: installed flush and snug on the scalp with a natural, "
         "soft hairline that blends into her forehead and temples, no visible lace, cap or edges, the top close "
-        "to the scalp, the hair falling naturally around the face, in front of both ears and over the shoulders, "
+        "to the scalp, the hair falling naturally around the face and over the shoulders and covering both ears "
+        "completely, the same on the left and the right (do not draw any ears), "
         "with the hair casting soft natural shadows where it touches the forehead, cheeks, neck and shoulders. "
         "Hide all of her own hair, scarf or cap completely under the wig. The light on the face, hair and "
         "clothes must match, as in one real photograph.\n"
@@ -177,7 +178,8 @@ def build_prompt_ai(p: dict) -> str:
         "natural lip colour. Keep real skin texture, never plastic or painted. She must stay unmistakably the "
         "same person: exactly the same face shape, eyes, eye shape and spacing, eyebrow shape, nose, lips, "
         "jawline, age and expression, and exactly the same skin tone (do not lighten or darken her skin). "
-        "Keep glasses, piercings and jewellery exactly as they are.\n"
+        "Do not add anything that is not in image 1: no glasses, earrings, jewellery or accessories she is not "
+        "already wearing. If she wears glasses or a necklace, keep them exactly as they are.\n"
         "Keep her clothing exactly as in image 1: the same garment, colour, pattern, neckline and fit. Keep the "
         "same pose, head size, position and framing as image 1. Replace the background with a plain, seamless, "
         "softly lit light grey-white studio backdrop. Shot on a good camera, photorealistic, not an illustration."
@@ -333,7 +335,9 @@ async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
     if lm is None:
         raise HTTPException(422, "We couldn't find a face in your photo. Please retake it.")
     x, y, w, h = head_crop(rgb.shape, lm, OUT_W / OUT_H)
-    crop = cv2.resize(rgb[y:y + h, x:x + w], (OUT_W, OUT_H), interpolation=cv2.INTER_AREA)
+    # INTER_AREA only for shrinking; enlarging with it duplicates pixels into visible blocks
+    crop = cv2.resize(rgb[y:y + h, x:x + w], (OUT_W, OUT_H),
+                      interpolation=cv2.INTER_AREA if w >= OUT_W else cv2.INTER_LANCZOS4)
     lm = (lm - [x, y]) * [OUT_W / w, OUT_H / h]
     bangs = bool(p.get("bangs"))
 
