@@ -302,12 +302,14 @@ def photo_problem(shape, lm: np.ndarray, blink: float = 0.0) -> str | None:
         return float(np.linalg.norm(lm[top] - lm[bot]) / max(np.linalg.norm(lm[a] - lm[b]), 1e-6))
     if blink > 0.55 or (ear(159, 145, 33, 133) + ear(386, 374, 362, 263)) / 2 < 0.13:
         return "Your eyes look closed. Please keep your eyes open and look at the camera."
-    if g.height > 0.5 * H:
-        return "You're too close. Hold the phone further away so your head, neck and shoulders are in the photo."
-    if g.height < 0.12 * H:
-        return "You're a bit far away. Move the phone closer so your face fills more of the frame."
-    if float((lm[FOREHEAD] + g.up * 0.35 * g.height)[1]) < -0.02 * H:
-        return "The top of your head is cut off. Hold the phone a little further away."
+    # The wig needs room: the whole head with space above it, and the neck and shoulders below.
+    # Tight photos are extended automatically (make_room); only extreme close-ups are refused.
+    if g.height > 0.55 * H:
+        return "You're too close. Hold the phone at arm's length so your whole head, neck and shoulders are in the photo."
+    if g.height < 0.1 * H:
+        return "You're a bit far away. Move the phone a little closer."
+    if float(lm[FOREHEAD][1]) < 0.02 * H or float(g.chin[1]) > 0.98 * H:
+        return "Part of your face is cut off. Hold the phone a little further away so your whole head is in the photo."
     return None
 
 
@@ -516,7 +518,7 @@ def clean_photo(src: np.ndarray, lm: np.ndarray, src_scale: float = 1.0) -> np.n
     left almost untouched. Without this, a dark/far-away selfie looks mottled and blotchy after retouch."""
     n = photo_noise(src, lm)
     up = max(0.0, 1.0 / max(src_scale, 1e-3) - 1.0)   # how much the photo was enlarged
-    h = float(np.clip(1.2 * n + 3.0 * up, 0, 12))
+    h = float(np.clip(1.0 * n + 2.0 * up, 0, 7))
     if h < 2.0:
         return src
     H, W = src.shape[:2]
@@ -620,7 +622,8 @@ def _warp_field(H: int, W: int, src_pts: np.ndarray, dst_pts: np.ndarray, weight
 
 def compose_ai(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.ndarray | None,
                seg_src: np.ndarray, seg_out: np.ndarray, background: str = "studio",
-               src_scale: float = 1.0, detail: float = 0.6, enhance: float = 0.75) -> np.ndarray | None:
+               src_scale: float = 1.0, detail: float = 0.6, enhance: float = 0.75,
+               added: np.ndarray | None = None) -> np.ndarray | None:
     """Natural blend: the AI renders the whole head (face, hairline, hair, light and shadows together,
     lightly beautified), then the face is put back into the customer's EXACT geometry and her real
     feature detail is restored, and her clothes always come from her own photo.
@@ -634,17 +637,22 @@ def compose_ai(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.
     M = align(src_lm, out_lm, strict=False)
     if M is None:
         return None
+    g = geom(src_lm)
+    fw = g.width
+    # Safety: if the AI changed the framing (zoomed/shrank the head) or the photo is very tight, the face
+    # would have to be stretched a lot to match; the caller then uses the safer photo-based blend.
+    scale = float(np.sqrt(abs(np.linalg.det(M[:, :2]))))
+    if not (0.88 < scale < 1.12) or g.height > 0.42 * H:
+        return None
     Minv = cv2.invertAffineTransform(M)
     to_src = lambda x, interp=cv2.INTER_LINEAR: cv2.warpAffine(x, Minv, (W, H), flags=interp, borderMode=cv2.BORDER_REPLICATE)
     ai = to_src(out).astype(np.float32)
     ai_lm = out_lm @ Minv[:, :2].T + Minv[:, 2]
-    g = geom(src_lm)
-    fw = g.width
 
     # 1. Her exact face shape: move every facial point of the AI face back to where it is on her photo.
     d = ai_lm - src_lm
-    if float(np.median(np.linalg.norm(d, axis=1))) > 0.12 * g.height:
-        return None  # the AI changed the face too much to correct safely
+    if float(np.median(np.linalg.norm(d, axis=1))) > 0.05 * g.height or float(np.percentile(np.linalg.norm(d, axis=1), 90)) > 0.1 * g.height:
+        return None  # the AI changed the face shape too much to correct without visible stretching
     lim = 0.1 * fw
     nrm = np.linalg.norm(d, axis=1, keepdims=True)
     d = d * np.minimum(1, lim / np.maximum(nrm, 1e-6))
@@ -707,10 +715,18 @@ def compose_ai(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.
     # Clothes the AI drew where she has none (e.g. it widened the shoulders) are never shown
     ai_clothes_only = (seg_ai[..., CLOTHES] > 0.5) & (clothes_keep(seg_src, src_lm) < 0.2) & (hair < 0.3)
     ai_clothes_only &= ~(old_hair(seg_src, src_lm) > 0.4)  # (under her old long hair the AI must fill in)
+    added = np.zeros((H, W), bool) if added is None else added.astype(bool)
+    ai_clothes_only &= ~added  # (beyond the edge of her photo the AI continues her shoulders)
 
     # 4. Background: clean studio backdrop with a soft, natural edge and a little light wrap.
     if background in ("studio", "white"):
-        person = np.clip(1 - seg_ai[..., BG], 0, 1)
+        # Only the new hair, skin and her own clothes are "person"; leftovers the AI drew (bits of a hood,
+        # room objects) go to the backdrop instead of floating round her.
+        person = np.clip(seg_ai[..., HAIR] + seg_ai[..., FACE_SKIN] + seg_ai[..., BODY_SKIN], 0, 1)
+        person = np.maximum(person, np.clip((clothes_keep(seg_src, src_lm) - 0.2) / 0.5, 0, 1))
+        # where her old long hair hid her top, the AI's continuation of the top is part of her
+        under_old = cv2.dilate((old_hair(seg_src, src_lm) > 0.4).astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+        person = np.maximum(person, (seg_ai[..., CLOTHES] + seg_ai[..., OTHERS]) * (under_old | added))
         person = np.maximum(person, keep)
         person = np.maximum(person, (_poly_mask(src.shape, src_lm[FACE_OVAL]) > 0.5) * np.clip(seg_src[..., FACE_SKIN] + seg_src[..., BODY_SKIN] + (1 - seg_ai[..., BG]), 0, 1))
         person[ai_clothes_only] = 0
@@ -844,6 +860,33 @@ def geom(lm: np.ndarray) -> FaceGeom:
     v = lm[FOREHEAD] - lm[CHIN]
     h = float(np.linalg.norm(v))
     return FaceGeom(up=v / max(h, 1e-6), height=h, width=float(np.linalg.norm(lm[234] - lm[454])), chin=lm[CHIN])
+
+
+def make_room(rgb: np.ndarray, lm: np.ndarray, aspect: float = 2 / 3):
+    """Close selfies leave no room above the head (or below the chin) for a wig. Extend the canvas so a
+    full head-and-shoulders frame fits; the extension is a soft, blurred continuation that the AI repaints
+    (hair, top of the head, shoulders, backdrop). Returns (image, landmarks, valid) where valid is 1 on
+    real photo pixels and 0 on the added area."""
+    H, W = rgb.shape[:2]
+    g = geom(lm)
+    # Enough for the head with room above it, the hair and the shoulders; not a whole invented body.
+    box_h = 3.4 * g.height
+    box_w = box_h * aspect
+    cx = float(lm[FACE_OVAL][:, 0].mean())
+    top = float(lm[FOREHEAD][1]) - 1.2 * g.height
+    pt = int(np.ceil(max(0.0, -top)))
+    pb = int(np.ceil(max(0.0, top + box_h - H)))
+    pl = int(np.ceil(max(0.0, box_w / 2 - cx)))
+    pr = int(np.ceil(max(0.0, cx + box_w / 2 - W)))
+    valid = np.ones((H, W), np.uint8)
+    if max(pt, pb, pl, pr) == 0:
+        return rgb, lm, valid
+    big = cv2.copyMakeBorder(rgb, pt, pb, pl, pr, cv2.BORDER_REPLICATE)
+    valid = cv2.copyMakeBorder(valid, pt, pb, pl, pr, cv2.BORDER_CONSTANT, value=0)
+    soft = cv2.GaussianBlur(big, (0, 0), max(8.0, 0.04 * max(big.shape[:2])))
+    m = cv2.GaussianBlur((1 - valid).astype(np.float32), (0, 0), 6)[..., None]
+    big = np.clip(big * (1 - m) + soft * m, 0, 255).astype(np.uint8)
+    return big, lm + np.float32([pl, pt]), valid
 
 
 def head_crop(shape: tuple[int, int], lm: np.ndarray, aspect: float = 2 / 3) -> tuple[int, int, int, int]:
