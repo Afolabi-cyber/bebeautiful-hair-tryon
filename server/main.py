@@ -23,7 +23,7 @@ import catalog_store
 import db
 from status import STATUS
 from admin import router as admin_router
-from faces import HAIR, FaceTool, clothes_keep, compose_ai, Segmenter, hair_zone, head_crop, keep_mask, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
+from faces import HAIR, FaceTool, backdrop, clothes_keep, compose_ai, make_room, Segmenter, hair_zone, head_crop, keep_mask, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -334,10 +334,13 @@ async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
     lm = await landmarks(rgb)
     if lm is None:
         raise HTTPException(422, "We couldn't find a face in your photo. Please retake it.")
+    # Close selfies: extend the canvas so there's room for the full wig above the head and the shoulders
+    rgb, lm, valid = make_room(rgb, lm, OUT_W / OUT_H)
     x, y, w, h = head_crop(rgb.shape, lm, OUT_W / OUT_H)
     # INTER_AREA only for shrinking; enlarging with it duplicates pixels into visible blocks
     crop = cv2.resize(rgb[y:y + h, x:x + w], (OUT_W, OUT_H),
                       interpolation=cv2.INTER_AREA if w >= OUT_W else cv2.INTER_LANCZOS4)
+    added = cv2.resize(valid[y:y + h, x:x + w], (OUT_W, OUT_H), interpolation=cv2.INTER_NEAREST) == 0
     lm = (lm - [x, y]) * [OUT_W / w, OUT_H / h]
     bangs = bool(p.get("bangs"))
 
@@ -354,6 +357,9 @@ async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
     # seat the wig flush instead of leaving old hair (or a gap) next to it. The face stays locked.
     try:
         seg_src = await segment(crop)
+        if seg_src is not None and added.any():
+            seg_src[added] = 0
+            seg_src[added, 0] = 1  # the added area is not part of her photo: nothing of hers is there
     except Exception:
         log.exception("Hair model failed on this photo")
         seg_src = None
@@ -415,7 +421,7 @@ async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
     try:
         if ai_mode and seg_out is not None:
             out_final = compose_ai(crop, lm, out, out_lm, seg_src, seg_out, RESULT_BACKGROUND, src_scale=w / OUT_W,
-                                   enhance=FACE_ENHANCE)
+                                   enhance=FACE_ENHANCE, added=added)
             mode = "ai blend"
         if out_final is None:
             # AI face couldn't be matched to her photo reliably: use her own face with the AI hair
@@ -428,7 +434,11 @@ async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
         raise HTTPException(502, "We couldn't finish this look. Please try again.")
     out, locked = out_final, True
     log.info("try-on finished: mode=%s", mode)
-    return {"before": crop, "after": out, "locked": locked, "mode": mode}
+    before = crop
+    if added.any():  # the "before" picture shows the clean backdrop where the canvas was extended
+        a_ = cv2.GaussianBlur(added.astype(np.float32), (0, 0), 3)[..., None]
+        before = np.clip(crop * (1 - a_) + backdrop(OUT_H, OUT_W, "studio") * a_, 0, 255).astype(np.uint8)
+    return {"before": before, "after": out, "locked": locked, "mode": mode}
 
 
 app.mount("/wigs", StaticFiles(directory=catalog_store.WIGS), name="wigs")
