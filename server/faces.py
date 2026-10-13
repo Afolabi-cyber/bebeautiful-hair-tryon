@@ -510,8 +510,32 @@ def clothes_keep(seg_src: np.ndarray, src_lm: np.ndarray) -> np.ndarray:
     return c
 
 
+def clean_photo(src: np.ndarray, lm: np.ndarray, src_scale: float = 1.0) -> np.ndarray:
+    """Remove camera noise and compression blotches from the face area of a noisy or enlarged selfie,
+    with an edge-preserving denoiser (eyes, brows, lips and face shape stay sharp). Clean photos are
+    left almost untouched. Without this, a dark/far-away selfie looks mottled and blotchy after retouch."""
+    n = photo_noise(src, lm)
+    up = max(0.0, 1.0 / max(src_scale, 1e-3) - 1.0)   # how much the photo was enlarged
+    h = float(np.clip(1.2 * n + 3.0 * up, 0, 12))
+    if h < 2.0:
+        return src
+    H, W = src.shape[:2]
+    g = geom(lm)
+    x0, x1 = int(max(0, lm[:, 0].min() - 0.6 * g.width)), int(min(W, lm[:, 0].max() + 0.6 * g.width))
+    y0, y1 = int(max(0, lm[:, 1].min() - 0.8 * g.height)), int(min(H, lm[:, 1].max() + 0.8 * g.height))
+    roi = np.ascontiguousarray(src[y0:y1, x0:x1])
+    den = cv2.fastNlMeansDenoisingColored(roi, None, h, h * 0.8, 7, 21).astype(np.float32)
+    w = np.ones(roi.shape[:2], np.float32)
+    e = max(4, int(0.05 * min(roi.shape[:2])))
+    w[:e] *= np.linspace(0, 1, e)[:, None]; w[-e:] *= np.linspace(1, 0, e)[:, None]
+    w[:, :e] *= np.linspace(0, 1, e)[None]; w[:, -e:] *= np.linspace(1, 0, e)[None]
+    out = src.copy()
+    out[y0:y1, x0:x1] = np.clip(roi * (1 - w[..., None]) + den * w[..., None], 0, 255).astype(np.uint8)
+    return out
+
+
 def _clone_face(src: np.ndarray, src_lm: np.ndarray, ai: np.ndarray, seg_src: np.ndarray, seg_ai: np.ndarray,
-                enhance: float) -> np.ndarray:
+                enhance: float, src_scale: float = 1.0) -> np.ndarray:
     """Her own face (lightly retouched) placed into the AI picture with NO visible edge.
 
     Her face keeps all of its own detail; only its broad light and colour are matched to the AI
@@ -525,7 +549,8 @@ def _clone_face(src: np.ndarray, src_lm: np.ndarray, ai: np.ndarray, seg_src: np
     body = None
     if seg_src is not None:
         body = cv2.GaussianBlur(np.clip((seg_src[..., BODY_SKIN] - 0.3) / 0.4, 0, 1), (0, 0), max(2.0, 0.01 * W))
-    face = (beautify(src, src_lm, enhance, skin_extra=body) if enhance > 0 else src).astype(np.float32)
+    clean = clean_photo(src, src_lm, src_scale)
+    face = (beautify(clean, src_lm, enhance, skin_extra=body) if enhance > 0 else clean).astype(np.float32)
     ell = lambda r: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * max(1, int(r)) + 1,) * 2)
 
     hair_ai = cv2.dilate((seg_ai[..., HAIR] > 0.4).astype(np.uint8), ell(0.025 * fw)) > 0
@@ -661,14 +686,14 @@ def compose_ai(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.
     #    Poisson blending ("seamless clone") keeps all of her real facial detail but takes on the colour
     #    and light of the AI picture at the edges, so it sits in the same light as the new hair with no seam.
     #    Braids the AI drew falling over the cheeks stay in front.
-    ai = _clone_face(src, src_lm, ai, seg_src, seg_ai, enhance)
+    ai = _clone_face(src, src_lm, ai, seg_src, seg_ai, enhance, src_scale)
 
     # Her real eyes, brows, nose and lips: put back their fine detail (not their colour or light).
     feats = np.zeros((H, W), np.float32)
     for ids, grow in ((LEFT_EYE, 0.05), (RIGHT_EYE, 0.05), (LEFT_BROW, 0.03), (RIGHT_BROW, 0.03),
                       (LIPS, 0.03), (NOSTRILS, 0.02)):
         feats = np.maximum(feats, _poly_mask(src.shape, src_lm[ids], grow=max(1, int(grow * fw)), blur=0.02 * fw))
-    srcf = src.astype(np.float32)
+    srcf = clean_photo(src, src_lm, src_scale).astype(np.float32)  # (noise-free detail)
     ts = max(1.0, 0.006 * fw)
     hf = (srcf - cv2.GaussianBlur(srcf, (0, 0), ts)) - (ai - cv2.GaussianBlur(ai, (0, 0), ts))
     ai += hf * (feats * detail)[..., None]
@@ -721,7 +746,7 @@ def compose_ai(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.
         made = 1 - keep
 
     # 5. One consistent camera grain over everything the AI made
-    n = photo_noise(src, src_lm)
+    n = min(photo_noise(src, src_lm) * 0.5, 1.6)  # low: the face itself was cleaned
     if n > 0.3:
         rng = np.random.default_rng(int(src[::97, ::89].sum()) % (2 ** 32))
         gr = cv2.GaussianBlur(rng.normal(0, 1, (H, W)).astype(np.float32), (0, 0), 0.55)
