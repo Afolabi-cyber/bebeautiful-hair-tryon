@@ -23,7 +23,7 @@ import catalog_store
 import db
 from status import STATUS
 from admin import router as admin_router
-from faces import HAIR, FaceTool, backdrop, clothes_keep, compose_ai, make_room, Segmenter, hair_zone, head_crop, keep_mask, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
+from faces import CLOTHES, FACE_OVAL, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, make_room, Segmenter, hair_zone, head_crop, keep_mask, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -35,7 +35,10 @@ RESULT_BACKGROUND = os.getenv("RESULT_BACKGROUND", "studio").lower()
 # "ai" (default): the AI renders the whole head (face, hair, light and shadows together, lightly
 # beautified); the face is then locked back to the customer's exact shape and features and her clothes
 # always come from her photo. "photo": her original face and photo with only the AI hair laid on top.
-BLEND_MODE = os.getenv("BLEND_MODE", "ai").strip().lower()
+BLEND_MODE = os.getenv("BLEND_MODE", "pure").strip().lower()
+# "pure" (default): the AI makes the final picture; the server only prepares the photo and checks the
+# result (same person, same clothes), regenerating if a check fails. Nothing is pasted back in.
+TRYON_ATTEMPTS = max(1, min(3, int(os.getenv("TRYON_ATTEMPTS", "2"))))
 FACE_ENHANCE = min(1.0, max(0.0, float(os.getenv("FACE_ENHANCE", "0.75"))))  # retouch strength: 0 = off, 0.75 = default, 1 = strongest
 OUT_W, OUT_H = 1024, 1536
 MAX_UPLOAD = 15 * 1024 * 1024
@@ -186,6 +189,79 @@ def build_prompt_ai(p: dict) -> str:
     )
 
 
+def build_prompt_pure(p: dict, retry_note: str = "") -> str:
+    desc = p.get("description") or p["name"]
+    return (
+        "Image 1 is a photo of a customer. Image 2 is a product photo of a wig (shown on its own, face area empty).\n"
+        f"Wig: {desc}.\n\n"
+        "Create ONE finished, photorealistic beauty portrait of the customer from image 1 wearing this exact wig, as if "
+        "photographed in a professional studio. It must look like a real photograph, never like a collage or an edit.\n\n"
+        "THE WIG: reproduce image 2 faithfully: the same braid size and pattern, parting, curl type and where the curls "
+        "start, the same colours and ombre in the same places, the same length, density and fullness. Do not invent a "
+        "different style. Fit it like a professionally installed wig: flush and snug on the scalp, the top close to the "
+        "head, a soft natural hairline blending into her forehead and temples, no visible lace, cap or edges. The hair "
+        "covers both ears completely and falls naturally over the shoulders and down the front and back, as long as the "
+        "wig is, with real volume, shadows and light, casting soft shadows on the neck and shoulders where it touches "
+        "them. Completely hide her own hair and anything on her head (scarf, cap, hood, headphones, bonnet) under the wig.\n\n"
+        "THE FACE: it must be unmistakably the same person: exactly the same face shape and size, eyes, eye shape and "
+        "spacing, eyebrows, nose, lips, jaw, chin, ears hidden, age, expression and exactly the same skin tone (never "
+        "lighter, darker or greyer). Keep the head exactly where it is in image 1, at the same size and angle. Give the "
+        "face a professional beauty retouch: smooth, even, flawless-looking skin with a soft healthy glow, blemishes, "
+        "spots, shine and dark circles removed, neat brows, subtle natural lip colour, but keep a natural skin texture "
+        "so it never looks plastic or painted. Keep glasses only if she is wearing them; do not add glasses, earrings, "
+        "jewellery or anything else she is not wearing.\n\n"
+        "THE CLOTHES: keep her clothing exactly as in image 1: the same garment, colour, pattern, print, neckline, collar "
+        "and fit, and keep any necklace. The wig's hair may fall in front of the clothes.\n\n"
+        "THE PHOTO: soft, even, flattering studio light that is the same on the face, hair, neck and clothes. A plain, "
+        "seamless, softly lit light grey-white studio backdrop, with nothing else in the background. Head-and-shoulders "
+        "framing as in image 1. If any part of image 1 is blurred or empty at the edges, continue the hair, shoulders "
+        "and backdrop naturally there. Sharp, clean, high quality, photorealistic."
+        + (f"\n\nIMPORTANT, previous attempt failed: {retry_note}" if retry_note else "")
+    )
+
+
+def check_result(crop: np.ndarray, lm: np.ndarray, out: np.ndarray, out_lm, seg_src, seg_out) -> tuple[float, str]:
+    """How good an AI result is (0 = perfect, higher = worse) and what went wrong, for a retry.
+    Checks only; the picture itself is never edited."""
+    if out_lm is None:
+        return 99.0, "the face was not clearly visible; show her face clearly, looking at the camera"
+    M = align(lm, out_lm, strict=False)
+    if M is None:
+        return 50.0, "the face moved, changed size or changed shape; keep her face exactly as in image 1"
+    g = geom(lm)
+    mapped = lm @ M[:, :2].T + M[:, 2]
+    # identity geometry: how far her eyes, brows, nose, lips and face outline moved relative to each other
+    ids = np.unique(np.concatenate([LEFT_EYE, RIGHT_EYE, LEFT_BROW, RIGHT_BROW, LIPS, NOSTRILS, FACE_OVAL]))
+    shape_err = float(np.percentile(np.linalg.norm(mapped[ids] - out_lm[ids], axis=1), 75)) / g.height
+    scale = float(np.sqrt(abs(np.linalg.det(M[:, :2]))))
+    shift = float(np.linalg.norm(M[:, 2] + lm.mean(0) @ M[:, :2].T - lm.mean(0))) / g.height
+    score, why = 0.0, []
+    # calibrated on real faces: same person (retouched, relit) <= 0.016, a different person >= 0.049
+    if shape_err > 0.022:
+        score += (shape_err - 0.022) * 400 + 3
+        why.append("her facial features changed; keep exactly the same eyes, nose, lips and face shape")
+    if abs(scale - 1) > 0.1 or shift > 0.25:
+        score += 10
+        why.append("the head moved or changed size; keep the same framing as image 1")
+    if seg_src is not None and seg_out is not None:
+        H, W = crop.shape[:2]
+        cl = (seg_src[..., CLOTHES] > 0.6) & ~cv2.dilate((old_hair(seg_src, lm) > 0.4).astype(np.uint8), np.ones((15, 15), np.uint8)).astype(bool)
+        Minv = cv2.invertAffineTransform(M)
+        out_s = cv2.warpAffine(out, Minv, (W, H), borderMode=cv2.BORDER_REPLICATE)
+        hair_o = cv2.warpAffine(np.ascontiguousarray(seg_out[..., HAIR]), Minv, (W, H)) > 0.3
+        cl &= ~cv2.dilate(hair_o.astype(np.uint8), np.ones((9, 9), np.uint8)).astype(bool)
+        if cl.sum() > 2000:
+            la = cv2.cvtColor(crop, cv2.COLOR_RGB2LAB).astype(np.float32)
+            lb = cv2.cvtColor(out_s, cv2.COLOR_RGB2LAB).astype(np.float32)
+            # colour of the garment (broad): allow the lighting to change a little, not the colour
+            dab = float(np.linalg.norm(la[cl][:, 1:].mean(0) - lb[cl][:, 1:].mean(0)))
+            dL = abs(float(la[cl][:, 0].mean() - lb[cl][:, 0].mean()))
+            if dab > 9 or dL > 30:
+                score += max(dab - 9, 0) + max(dL - 30, 0) * 0.5 + 5
+                why.append("her clothes changed colour; keep her clothing exactly as in image 1")
+    return score, "; ".join(why)
+
+
 def to_rgb(data: bytes) -> np.ndarray:
     try:
         img = Image.open(io.BytesIO(data))
@@ -302,7 +378,7 @@ async def tryon(req: Request, session_id: str = Form(...), wig_id: str = Form(..
     if key in _cache:
         _cache.move_to_end(key)
         return _cache[key]
-    if segmenter() is None and not ALLOW_WITHOUT_HAIR_MODEL:
+    if BLEND_MODE != "pure" and segmenter() is None and not ALLOW_WITHOUT_HAIR_MODEL:
         raise HTTPException(503, "Virtual try-on is being set up. Please try again in a few minutes.")
     rate_limit("tryon", client_ip(req), TRYONS_PER_HOUR)
     if db.count_tryons(session_id, "ok") >= MAX_TRIES:
@@ -327,6 +403,62 @@ async def tryon(req: Request, session_id: str = Form(...), wig_id: str = Form(..
     if len(_cache) > 50:
         _cache.popitem(last=False)
     return out
+
+
+async def ai_edit(crop: np.ndarray, wig_rgb: np.ndarray, prompt: str) -> np.ndarray:
+    kwargs = dict(
+        model=MODEL,
+        image=[("customer.png", encode(crop), "image/png"), ("wig.png", encode(wig_rgb), "image/png")],
+        prompt=prompt,
+        size=f"{OUT_W}x{OUT_H}",
+        quality=QUALITY,
+        output_format="png",
+        n=1,
+    )
+    if supports_fidelity(MODEL):
+        kwargs["input_fidelity"] = "high"
+    try:
+        res = await openai_client().images.edit(**kwargs)
+    except APIStatusError as e:
+        log.warning("OpenAI error %s: %s", e.status_code, e.message)
+        msg = ("The AI couldn't process this photo. Try a different one."
+               if e.status_code == 400 else "The AI is busy right now, please try again.")
+        raise HTTPException(502, msg)
+    out = to_rgb(base64.b64decode(res.data[0].b64_json))
+    if out.shape[:2] != (OUT_H, OUT_W):
+        out = cv2.resize(out, (OUT_W, OUT_H), interpolation=cv2.INTER_CUBIC)
+    return out
+
+
+async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dict, seg_src, added) -> dict:
+    """The AI makes the final picture. The server only checks it (same person, same clothes, face in
+    place) and asks the AI again with a note on what went wrong if a check fails; the best is kept."""
+    best, note, tries = None, "", 0
+    for attempt in range(TRYON_ATTEMPTS):
+        tries += 1
+        out = await ai_edit(crop, wig_rgb, build_prompt_pure(p, note))
+        out_lm = await landmarks(out)
+        seg_out = None
+        if seg_src is not None:
+            try:
+                seg_out = await segment(out)
+            except Exception:
+                seg_out = None
+        score, why = check_result(crop, lm, out, out_lm, seg_src, seg_out)
+        log.info("try-on attempt %d: score %.1f %s", tries, score, why or "(passed)")
+        if best is None or score < best[0]:
+            best = (score, out)
+        if score < 1.0:
+            break
+        note = why
+    score, out = best
+    before = crop
+    if added is not None and added.any():
+        a_ = cv2.GaussianBlur(added.astype(np.float32), (0, 0), 3)[..., None]
+        before = np.clip(crop * (1 - a_) + backdrop(OUT_H, OUT_W, "studio") * a_, 0, 255).astype(np.uint8)
+    mode = f"pure ai ({tries} attempt{'s' if tries > 1 else ''}, check score {score:.1f})"
+    log.info("try-on finished: mode=%s", mode)
+    return {"before": before, "after": out, "locked": True, "mode": mode}
 
 
 async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
@@ -369,6 +501,9 @@ async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
         own = cv2.dilate(own, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * g + 1, 2 * g + 1)))
         zone = np.maximum(zone, own)
         zone[skin_lock(seg_src, lm, bangs) > 0] = 0  # her real forehead/temples: the wig is built around them
+    if BLEND_MODE == "pure":
+        return await run_pure(crop, lm, wig_rgb, p, seg_src, added)
+
     ai_mode = BLEND_MODE == "ai" and seg_src is not None
     if ai_mode:
         # The AI may repaint everything (face, hair, background) except her clothes.
