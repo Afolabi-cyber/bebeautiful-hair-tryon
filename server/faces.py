@@ -43,6 +43,29 @@ LIPS = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0
 NOSTRILS = [98, 97, 2, 326, 327, 294, 278, 344, 440, 275, 4, 45, 220, 115, 48, 64]
 
 
+def _lab(rgb: np.ndarray) -> np.ndarray:
+    """RGB (0..255, any dtype) -> Lab in float32 on OpenCV's 8-bit scale (L 0..255, a/b centred on 128),
+    computed in full precision so smooth skin gradients never get stepped into visible contour lines."""
+    lab = cv2.cvtColor(np.clip(np.asarray(rgb, np.float32) / 255.0, 0, 1), cv2.COLOR_RGB2LAB)
+    lab[..., 0] *= 255.0 / 100.0
+    lab[..., 1:] += 128.0
+    return lab
+
+
+def _rgb(lab: np.ndarray) -> np.ndarray:
+    """Inverse of _lab: float32 RGB 0..255 (no rounding)."""
+    x = np.asarray(lab, np.float32).copy()
+    x[..., 0] *= 100.0 / 255.0
+    x[..., 1:] -= 128.0
+    return np.clip(cv2.cvtColor(x, cv2.COLOR_LAB2RGB), 0, 1) * 255.0
+
+
+def _to_u8(img: np.ndarray, seed: int = 7) -> np.ndarray:
+    """Round to 8-bit with a tiny dither, so gradients don't band."""
+    rng = np.random.default_rng(seed)
+    return np.clip(img + rng.uniform(-0.5, 0.5, img.shape).astype(np.float32), 0, 255).astype(np.uint8)
+
+
 def ensure_model(url: str = MODEL_URL, path: str = MODEL_PATH, min_bytes: int = 500_000) -> str:
     """Download a model once. A partial or blocked download (tiny file, HTML error page) is removed
     so it is retried next time instead of failing forever."""
@@ -279,12 +302,14 @@ def photo_problem(shape, lm: np.ndarray, blink: float = 0.0) -> str | None:
         return float(np.linalg.norm(lm[top] - lm[bot]) / max(np.linalg.norm(lm[a] - lm[b]), 1e-6))
     if blink > 0.55 or (ear(159, 145, 33, 133) + ear(386, 374, 362, 263)) / 2 < 0.13:
         return "Your eyes look closed. Please keep your eyes open and look at the camera."
-    if g.height > 0.5 * H:
-        return "You're too close. Hold the phone further away so your head, neck and shoulders are in the photo."
-    if g.height < 0.12 * H:
-        return "You're a bit far away. Move the phone closer so your face fills more of the frame."
-    if float((lm[FOREHEAD] + g.up * 0.35 * g.height)[1]) < -0.02 * H:
-        return "The top of your head is cut off. Hold the phone a little further away."
+    # The wig needs room: the whole head with space above it, and the neck and shoulders below.
+    # Tight photos are extended automatically (make_room); only extreme close-ups are refused.
+    if g.height > 0.55 * H:
+        return "You're too close. Hold the phone at arm's length so your whole head, neck and shoulders are in the photo."
+    if g.height < 0.1 * H:
+        return "You're a bit far away. Move the phone a little closer."
+    if float(lm[FOREHEAD][1]) < 0.02 * H or float(g.chin[1]) > 0.98 * H:
+        return "Part of your face is cut off. Hold the phone a little further away so your whole head is in the photo."
     return None
 
 
@@ -304,7 +329,7 @@ def ear_area(src_shape, src_lm: np.ndarray) -> np.ndarray:
 
 def transfer_hair(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.ndarray | None,
                   zone: np.ndarray, seg_src: np.ndarray | None = None, seg_out: np.ndarray | None = None,
-                  enhance: float = 0.75, background: str = "studio") -> np.ndarray:
+                  enhance: float = 0.75, background: str = "studio", src_scale: float = 1.0) -> np.ndarray:
     """Final image = the customer's ORIGINAL photo, with the AI image used only inside `zone`
     (see hair_zone). If segmentation is available, only the actual new hair inside the zone is used,
     so clothes under and between the braids are the customer's too. Returns an image in src's frame.
@@ -316,7 +341,16 @@ def transfer_hair(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: 
     Minv = cv2.invertAffineTransform(M)
     to_src = lambda x: cv2.warpAffine(x, Minv, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
     out_s = to_src(out).astype(np.float32)
-    base = beautify(src, src_lm, enhance) if enhance > 0 else src.copy()
+    # The customer's photo is often enlarged to fill the frame (soft), while the AI draws crisp detail.
+    # Soften the AI picture to the photo's real sharpness so hair and face look like ONE photo.
+    if src_scale < 0.95:
+        sig = float(np.clip(0.5 * np.sqrt(max(1 / src_scale ** 2 - 1, 0)), 0, 1.8))
+        if sig > 0.25:
+            out_s = cv2.GaussianBlur(out_s, (0, 0), sig)
+    body_skin = None
+    if seg_src is not None:
+        body_skin = cv2.GaussianBlur(np.clip((seg_src[..., BODY_SKIN] - 0.3) / 0.4, 0, 1), (0, 0), max(2.0, 0.01 * W))
+    base = beautify(src, src_lm, enhance, skin_extra=body_skin) if enhance > 0 else src.copy()
     z = cv2.GaussianBlur(zone.astype(np.float32), (0, 0), max(1.5, 0.004 * W))  # soft fence edge
 
     if seg_out is None:
@@ -399,12 +433,26 @@ def transfer_hair(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: 
     skin_out = np.clip(to_src(np.ascontiguousarray(seg_out[..., FACE_SKIN] + seg_out[..., BODY_SKIN])), 0, 1)
     both = face_in & (skin_out > 0.5)
     if both.sum() > 200:
-        lab_out = cv2.cvtColor(np.clip(out_s, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+        lab_out = _lab(out_s)
         shift = lab_src[both].mean(axis=0) - lab_out[both].mean(axis=0)
-        fixed = cv2.cvtColor(np.clip(lab_out + shift, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB).astype(np.float32)
+        fixed = _rgb(lab_out + shift)
         out_s = out_s * (1 - skin_out[..., None]) + fixed * skin_out[..., None]
 
     a = a * (1 - above_skull(src.shape, src_lm))  # never hair floating above the head
+
+    # Natural hair edges. Semi-transparent edge pixels of the AI hair still carry the AI's own
+    # forehead/background colour, which shows as a light halo round the hairline and curls; pull
+    # them toward the local hair colour. Then feather the hairline where it meets her skin a little,
+    # like real baby hairs, instead of a hard cut-out edge.
+    hp = (p > 0.85).astype(np.float32)
+    hsig = max(2.0, 0.012 * W)
+    hair_col = cv2.GaussianBlur(out_s * hp[..., None], (0, 0), hsig) / np.maximum(cv2.GaussianBlur(hp, (0, 0), hsig), 1e-4)[..., None]
+    has_col = np.clip(cv2.GaussianBlur(hp, (0, 0), hsig) * 8, 0, 1)
+    edge = np.clip((0.7 - p) / 0.65, 0, 1) * (p > 0.05) * has_col  # only the faint outer edge, not the strands
+    out_s = out_s + (hair_col - out_s) * (edge * 0.6)[..., None]
+    if seg_src is not None:
+        skin_near = cv2.GaussianBlur(np.clip((seg_src[..., FACE_SKIN] - 0.3) / 0.4, 0, 1), (0, 0), max(2.0, 0.01 * W))
+        a = a * (1 - skin_near) + cv2.GaussianBlur(a, (0, 0), max(1.0, 0.0025 * W)) * skin_near
 
     final = base.astype(np.float32) * (1 - a[..., None]) + out_s * a[..., None]
 
@@ -416,10 +464,321 @@ def transfer_hair(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: 
         person = np.maximum(person, _poly_mask(src.shape, src_lm[FACE_OVAL]))  # the face is always kept
         person = np.clip((person - 0.3) / 0.4, 0, 1)                          # crisper edge, no room halo
         person = np.maximum(person, ears)                                      # and so are the ears
-        person = cv2.GaussianBlur(person, (0, 0), 1.0)
-        alpha = np.maximum(person, a)[..., None]
-        final = final * alpha + backdrop(H, W, background) * (1 - alpha)
+        alpha = np.maximum(person, a)
+        # Small slivers of backdrop trapped between the jaw/neck and the hair look like cut-out errors:
+        # close them and fill them from the surrounding hair and skin.
+        solid = (alpha > 0.5).astype(np.uint8)
+        k = 2 * max(3, int(0.015 * W)) + 1
+        holes = (cv2.morphologyEx(solid, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))) > 0) & (solid == 0)
+        # only right next to the face, jaw and neck (natural gaps between braids stay open)
+        jaw = _poly_mask(src.shape, src_lm[FACE_OVAL])
+        g0 = geom(src_lm)
+        jaw = cv2.dilate((jaw > 0.5).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(0.18 * g0.width) + 1,) * 2))
+        holes &= jaw > 0
+        if holes.any():
+            hm = holes.astype(np.uint8) * 255
+            final = cv2.inpaint(np.clip(final, 0, 255).astype(np.uint8), hm, max(3, int(0.01 * W)), cv2.INPAINT_TELEA).astype(np.float32)
+            alpha = np.maximum(alpha, cv2.GaussianBlur(holes.astype(np.float32), (0, 0), 1.5))
+        # A real studio photo has a soft edge, not a razor-sharp cut-out
+        alpha = cv2.GaussianBlur(alpha, (0, 0), max(1.0, 0.0018 * W))
+        bd = backdrop(H, W, background)
+        # (no "light wrap": against a white backdrop it reads as a pale outline round the face)
+        final = final * alpha[..., None] + bd * (1 - alpha[..., None])
+        made = np.maximum(a, 1 - alpha)  # pixels that didn't come from the camera (AI hair, backdrop)
+    else:
+        made = a
+    # Matching camera grain: the AI hair and the backdrop are perfectly clean while the photo has
+    # sensor noise; giving everything the same fine grain makes it read as one photograph.
+    n = photo_noise(src, src_lm)
+    if n > 0.3:
+        rng = np.random.default_rng(int(src[::97, ::89].sum()) % (2 ** 32))
+        g = cv2.GaussianBlur(rng.normal(0, 1, (H, W)).astype(np.float32), (0, 0), 0.55)
+        g *= n / max(float(g.std()), 1e-6)
+        retouched = (keep_mask(src.shape, src_lm) > 0).astype(np.float32) * min(1.0, enhance) * 0.6
+        final += (g * np.maximum(made, retouched))[..., None]
     return np.clip(final, 0, 255).astype(np.uint8)
+
+
+def clothes_keep(seg_src: np.ndarray, src_lm: np.ndarray) -> np.ndarray:
+    """float 0..1: the customer's own clothes (and accessories worn below the face, like a necklace or
+    a bag strap), not covered by her old hair. These pixels always come from her photo."""
+    H, W = seg_src.shape[:2]
+    g = geom(src_lm)
+    ys, xs = np.mgrid[0:H, 0:W]
+    below = ((xs - g.chin[0]) * g.up[0] + (ys - g.chin[1]) * g.up[1]) < 0.15 * g.height  # glasses etc. excluded
+    c = seg_src[..., CLOTHES] + seg_src[..., OTHERS] * below
+    c = np.clip((c - 0.35) / 0.35, 0, 1) * (1 - np.clip((old_hair(seg_src, src_lm) - 0.3) / 0.4, 0, 1))
+    c[_poly_mask(seg_src.shape, src_lm[FACE_OVAL]) > 0.5] = 0
+    return c
+
+
+def clean_photo(src: np.ndarray, lm: np.ndarray, src_scale: float = 1.0) -> np.ndarray:
+    """Remove camera noise and compression blotches from the face area of a noisy or enlarged selfie,
+    with an edge-preserving denoiser (eyes, brows, lips and face shape stay sharp). Clean photos are
+    left almost untouched. Without this, a dark/far-away selfie looks mottled and blotchy after retouch."""
+    n = photo_noise(src, lm)
+    up = max(0.0, 1.0 / max(src_scale, 1e-3) - 1.0)   # how much the photo was enlarged
+    h = float(np.clip(1.0 * n + 2.0 * up, 0, 7))
+    if h < 2.0:
+        return src
+    H, W = src.shape[:2]
+    g = geom(lm)
+    x0, x1 = int(max(0, lm[:, 0].min() - 0.6 * g.width)), int(min(W, lm[:, 0].max() + 0.6 * g.width))
+    y0, y1 = int(max(0, lm[:, 1].min() - 0.8 * g.height)), int(min(H, lm[:, 1].max() + 0.8 * g.height))
+    roi = np.ascontiguousarray(src[y0:y1, x0:x1])
+    den = cv2.fastNlMeansDenoisingColored(roi, None, h, h * 0.8, 7, 21).astype(np.float32)
+    w = np.ones(roi.shape[:2], np.float32)
+    e = max(4, int(0.05 * min(roi.shape[:2])))
+    w[:e] *= np.linspace(0, 1, e)[:, None]; w[-e:] *= np.linspace(1, 0, e)[:, None]
+    w[:, :e] *= np.linspace(0, 1, e)[None]; w[:, -e:] *= np.linspace(1, 0, e)[None]
+    out = src.copy()
+    out[y0:y1, x0:x1] = np.clip(roi * (1 - w[..., None]) + den * w[..., None], 0, 255).astype(np.uint8)
+    return out
+
+
+def _clone_face(src: np.ndarray, src_lm: np.ndarray, ai: np.ndarray, seg_src: np.ndarray, seg_ai: np.ndarray,
+                enhance: float, src_scale: float = 1.0) -> np.ndarray:
+    """Her own face (lightly retouched) placed into the AI picture with NO visible edge.
+
+    Her face keeps all of its own detail; only its broad light and colour are matched to the AI
+    picture, and that match is measured on skin that is skin in BOTH pictures (never on hair or
+    background, which is what bled white or dark lines into the cheeks before). The hand-over to the
+    AI picture is wide and gradual and runs through plain skin, so there is no line to see.
+    """
+    H, W = src.shape[:2]
+    g = geom(src_lm)
+    fw = g.width
+    body = None
+    if seg_src is not None:
+        body = cv2.GaussianBlur(np.clip((seg_src[..., BODY_SKIN] - 0.3) / 0.4, 0, 1), (0, 0), max(2.0, 0.01 * W))
+    clean = clean_photo(src, src_lm, src_scale)
+    face = (beautify(clean, src_lm, enhance, skin_extra=body) if enhance > 0 else clean).astype(np.float32)
+    ell = lambda r: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * max(1, int(r)) + 1,) * 2)
+
+    hair_ai = cv2.dilate((seg_ai[..., HAIR] > 0.4).astype(np.uint8), ell(0.025 * fw)) > 0
+    skin_a = (seg_ai[..., FACE_SKIN] + seg_ai[..., BODY_SKIN]) > 0.5
+    skin_s = (seg_src[..., FACE_SKIN] + seg_src[..., BODY_SKIN]) > 0.5
+    oval = _poly_mask(src.shape, src_lm[FACE_OVAL]) > 0.5
+    core = keep_mask(src.shape, src_lm, shrink=0.88) > 0          # eyes, glasses, nose, mouth: always hers
+    # Her face: the oval plus her real forehead (where she has skin in her photo AND the AI drew skin)
+    region = (oval | (skin_s & (head_area(src.shape, src_lm) > 0.5))) & skin_a & ~hair_ai
+    region |= core & ~hair_ai
+    region = cv2.morphologyEx(region.astype(np.uint8), cv2.MORPH_OPEN, ell(0.01 * fw))
+    region = cv2.erode(region, ell(0.012 * fw))
+    if region.sum() < 0.2 * g.width * g.height:
+        return ai  # face mostly hidden: leave the AI picture (the identity lock already ran)
+
+    # Broad light/colour difference, measured only where both pictures show plain skin
+    both = (skin_a & skin_s & ~hair_ai).astype(np.float32)
+    both[core] = 0  # not inside eyes/glasses/mouth, where AI and photo legitimately differ
+    sig = max(4.0, 0.07 * fw)
+    diff = ai - face
+    wb = cv2.GaussianBlur(both, (0, 0), sig)
+    local = cv2.GaussianBlur(diff * both[..., None], (0, 0), sig) / np.maximum(wb, 1e-4)[..., None]
+    glob = diff[both > 0].mean(0) if both.sum() > 100 else np.zeros(3, np.float32)
+    conf = np.clip(wb * 4, 0, 1)[..., None]
+    offset = local * conf + glob * (1 - conf)
+    offset = cv2.GaussianBlur(offset, (0, 0), sig * 0.5)
+    matched = face + offset
+
+    # Wide, gradual hand-over through skin
+    soft = cv2.GaussianBlur(region.astype(np.float32), (0, 0), max(2.0, 0.02 * fw))
+    soft = np.clip((soft - 0.05) / 0.9, 0, 1)
+    soft = soft * soft * (3 - 2 * soft)
+    soft = np.maximum(soft, cv2.GaussianBlur((core & ~hair_ai).astype(np.float32), (0, 0), 0.01 * fw))
+    # Inside her real face outline, wherever the AI shows background instead of skin (its face was a
+    # little narrower), her own face is used fully: background must never tint the face edge.
+    # (only where her photo shows skin there, and only actual AI hair, not the safety margin round it, wins)
+    bg_in_face = oval & (seg_ai[..., BG] > 0.3) & ~(seg_ai[..., HAIR] > 0.4) & skin_s
+    if bg_in_face.any():
+        # widened a little (the AI's background edge is only known to a pixel or two) but kept inside
+        # her real skin, then feathered inward so no 1-pixel dip can let the background through
+        cover = cv2.dilate(bg_in_face.astype(np.uint8), ell(0.03 * fw)).astype(bool) & oval & (skin_s | ~(seg_ai[..., BG] < 0.1))
+        cover &= ~(seg_ai[..., HAIR] > 0.4)
+        c = cv2.GaussianBlur(cover.astype(np.float32), (0, 0), 1.5)
+        c = np.clip(c * 2, 0, 1) * cover + c * ~cover  # full strength inside, soft only outwards
+        soft = np.maximum(soft, c)
+    return ai * (1 - soft[..., None]) + matched * soft[..., None]
+
+
+def _warp_field(H: int, W: int, src_pts: np.ndarray, dst_pts: np.ndarray, weight: np.ndarray, step: int = 8):
+    """Smooth displacement field (inverse-distance weighted) so that a pixel at src_pts samples the
+    picture at dst_pts. Returns float32 maps for cv2.remap, faded out where weight is 0."""
+    gy, gx = np.mgrid[0:H:step, 0:W:step].astype(np.float32)
+    pts = np.stack([gx.ravel(), gy.ravel()], 1)
+    d = dst_pts - src_pts
+    acc = np.zeros_like(pts); wsum = np.zeros(len(pts), np.float32)
+    for i in range(0, len(src_pts), 64):  # chunked to keep memory small
+        sp, dd = src_pts[i:i + 64], d[i:i + 64]
+        dist2 = ((pts[:, None, :] - sp[None]) ** 2).sum(-1) + 25.0
+        w = 1.0 / dist2 ** 1.5
+        acc += (w[..., None] * dd[None]).sum(1); wsum += w.sum(1)
+    disp = (acc / wsum[:, None]).reshape(gx.shape + (2,))
+    disp = cv2.resize(disp, (W, H), interpolation=cv2.INTER_LINEAR)
+    disp *= weight[..., None]
+    xs, ys = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32))
+    return xs + disp[..., 0], ys + disp[..., 1]
+
+
+def compose_ai(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.ndarray | None,
+               seg_src: np.ndarray, seg_out: np.ndarray, background: str = "studio",
+               src_scale: float = 1.0, detail: float = 0.6, enhance: float = 0.75,
+               added: np.ndarray | None = None) -> np.ndarray | None:
+    """Natural blend: the AI renders the whole head (face, hairline, hair, light and shadows together,
+    lightly beautified), then the face is put back into the customer's EXACT geometry and her real
+    feature detail is restored, and her clothes always come from her own photo.
+
+    Returns an image in src's frame, or None if the AI image can't be matched to the photo reliably
+    (the caller then uses the photo-based composite instead).
+    """
+    if out_lm is None:
+        return None
+    H, W = src.shape[:2]
+    M = align(src_lm, out_lm, strict=False)
+    if M is None:
+        return None
+    g = geom(src_lm)
+    fw = g.width
+    # Safety: if the AI changed the framing (zoomed/shrank the head) or the photo is very tight, the face
+    # would have to be stretched a lot to match; the caller then uses the safer photo-based blend.
+    scale = float(np.sqrt(abs(np.linalg.det(M[:, :2]))))
+    if not (0.88 < scale < 1.12) or g.height > 0.42 * H:
+        return None
+    Minv = cv2.invertAffineTransform(M)
+    to_src = lambda x, interp=cv2.INTER_LINEAR: cv2.warpAffine(x, Minv, (W, H), flags=interp, borderMode=cv2.BORDER_REPLICATE)
+    ai = to_src(out).astype(np.float32)
+    ai_lm = out_lm @ Minv[:, :2].T + Minv[:, 2]
+
+    # 1. Her exact face shape: move every facial point of the AI face back to where it is on her photo.
+    d = ai_lm - src_lm
+    if float(np.median(np.linalg.norm(d, axis=1))) > 0.05 * g.height or float(np.percentile(np.linalg.norm(d, axis=1), 90)) > 0.1 * g.height:
+        return None  # the AI changed the face shape too much to correct without visible stretching
+    lim = 0.1 * fw
+    nrm = np.linalg.norm(d, axis=1, keepdims=True)
+    d = d * np.minimum(1, lim / np.maximum(nrm, 1e-6))
+    idx = np.arange(0, len(src_lm), 3)
+    idx = np.unique(np.concatenate([idx, FACE_OVAL, LEFT_EYE, RIGHT_EYE, LIPS, LEFT_BROW, RIGHT_BROW, NOSTRILS]))
+    region = _poly_mask(src.shape, src_lm[FACE_OVAL])
+    region = cv2.dilate(region, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(0.12 * fw) + 1,) * 2))
+    region = cv2.GaussianBlur(region, (0, 0), 0.08 * fw)
+    mx, my = _warp_field(H, W, src_lm[idx], src_lm[idx] + d[idx], region)
+    ai = cv2.remap(ai, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    seg_ai = cv2.remap(to_src(np.ascontiguousarray(seg_out)), mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+    # Same sharpness as her photo (it is often enlarged)
+    if src_scale < 0.95:
+        sig = float(np.clip(0.5 * np.sqrt(max(1 / src_scale ** 2 - 1, 0)), 0, 1.8))
+        if sig > 0.25:
+            ai = cv2.GaussianBlur(ai, (0, 0), sig)
+
+    # Her real skin tone: the AI may brighten slightly for a glow, but never lighten, darken or grey her
+    # skin. Any larger drift in tone is pulled back to her own (on all skin: face, neck, ears).
+    face_core = cv2.erode((_poly_mask(src.shape, src_lm[FACE_OVAL]) > 0.5).astype(np.uint8), np.ones((15, 15), np.uint8)) > 0
+    face_core &= seg_src[..., FACE_SKIN] > 0.4
+    skin_ai = np.clip(seg_ai[..., FACE_SKIN] + seg_ai[..., BODY_SKIN], 0, 1)
+    if face_core.sum() > 300:
+        lab_s = _lab(src)
+        lab_a = _lab(ai)
+        ms, ma = lab_s[face_core].mean(0), lab_a[face_core].mean(0)
+        dL = ma[0] - ms[0]
+        fixL = -(dL - 6) if dL > 6 else (-(dL + 2) if dL < -2 else 0.0)   # allow up to +6 brighter
+        fix = np.array([fixL, ms[1] - ma[1], ms[2] - ma[2]], np.float32)
+        fix[1:] = np.where(np.abs(fix[1:]) > 2.5, fix[1:] - np.sign(fix[1:]) * 2.5, 0)  # small warmth change ok
+        if np.abs(fix).max() > 0.5:
+            w_sk = cv2.GaussianBlur(np.maximum(skin_ai, (_poly_mask(src.shape, src_lm[FACE_OVAL]) > 0.5) * 1.0), (0, 0), 0.03 * fw)
+            lab_a += fix * w_sk[..., None]
+            ai = _rgb(lab_a)
+
+    # 2. HER face, every time. The AI draws a slightly different face on every run, so the inner face
+    #    (brows down to the chin, cheek to cheek) always comes from her own photo, lightly retouched.
+    #    Poisson blending ("seamless clone") keeps all of her real facial detail but takes on the colour
+    #    and light of the AI picture at the edges, so it sits in the same light as the new hair with no seam.
+    #    Braids the AI drew falling over the cheeks stay in front.
+    ai = _clone_face(src, src_lm, ai, seg_src, seg_ai, enhance, src_scale)
+
+    # Her real eyes, brows, nose and lips: put back their fine detail (not their colour or light).
+    feats = np.zeros((H, W), np.float32)
+    for ids, grow in ((LEFT_EYE, 0.05), (RIGHT_EYE, 0.05), (LEFT_BROW, 0.03), (RIGHT_BROW, 0.03),
+                      (LIPS, 0.03), (NOSTRILS, 0.02)):
+        feats = np.maximum(feats, _poly_mask(src.shape, src_lm[ids], grow=max(1, int(grow * fw)), blur=0.02 * fw))
+    srcf = clean_photo(src, src_lm, src_scale).astype(np.float32)  # (noise-free detail)
+    ts = max(1.0, 0.006 * fw)
+    hf = (srcf - cv2.GaussianBlur(srcf, (0, 0), ts)) - (ai - cv2.GaussianBlur(ai, (0, 0), ts))
+    ai += hf * (feats * detail)[..., None]
+
+    # 3. Her clothes, always from her photo. New hair falling in front of them stays.
+    hair = np.clip((seg_ai[..., HAIR] - 0.35) / 0.4, 0, 1)
+    hair = hair * hair * (3 - 2 * hair)
+    keep = clothes_keep(seg_src, src_lm) * (1 - hair)
+    keep = cv2.GaussianBlur(cv2.erode(keep, np.ones((3, 3), np.uint8)), (0, 0), 0.8)
+    final = ai * (1 - keep[..., None]) + srcf * keep[..., None]
+    # Clothes the AI drew where she has none (e.g. it widened the shoulders) are never shown
+    ai_clothes_only = (seg_ai[..., CLOTHES] > 0.5) & (clothes_keep(seg_src, src_lm) < 0.2) & (hair < 0.3)
+    ai_clothes_only &= ~(old_hair(seg_src, src_lm) > 0.4)  # (under her old long hair the AI must fill in)
+    added = np.zeros((H, W), bool) if added is None else added.astype(bool)
+    ai_clothes_only &= ~added  # (beyond the edge of her photo the AI continues her shoulders)
+
+    # 4. Background: clean studio backdrop with a soft, natural edge and a little light wrap.
+    if background in ("studio", "white"):
+        # Only the new hair, skin and her own clothes are "person"; leftovers the AI drew (bits of a hood,
+        # room objects) go to the backdrop instead of floating round her.
+        person = np.clip(seg_ai[..., HAIR] + seg_ai[..., FACE_SKIN] + seg_ai[..., BODY_SKIN], 0, 1)
+        person = np.maximum(person, np.clip((clothes_keep(seg_src, src_lm) - 0.2) / 0.5, 0, 1))
+        # where her old long hair hid her top, the AI's continuation of the top is part of her
+        under_old = cv2.dilate((old_hair(seg_src, src_lm) > 0.4).astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+        person = np.maximum(person, (seg_ai[..., CLOTHES] + seg_ai[..., OTHERS]) * (under_old | added))
+        person = np.maximum(person, keep)
+        person = np.maximum(person, (_poly_mask(src.shape, src_lm[FACE_OVAL]) > 0.5) * np.clip(seg_src[..., FACE_SKIN] + seg_src[..., BODY_SKIN] + (1 - seg_ai[..., BG]), 0, 1))
+        person[ai_clothes_only] = 0
+        person = np.clip((person - 0.25) / 0.5, 0, 1)
+        # Thin slivers of backdrop between her face/neck and the hair show as white lines: close them
+        # and fill them from the hair and skin around them.
+        solid = (person > 0.5).astype(np.uint8)
+        kk = 2 * max(3, int(0.035 * W)) + 1
+        holes = (cv2.morphologyEx(solid, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kk, kk))) > 0) & (solid == 0)
+        near = cv2.dilate((_poly_mask(src.shape, src_lm[FACE_OVAL]) > 0.5).astype(np.uint8),
+                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(0.3 * fw) + 1,) * 2)) > 0
+        ys_, xs_ = np.mgrid[0:H, 0:W]
+        neck = ((xs_ - g.chin[0]) ** 2 / (0.7 * fw) ** 2 + (ys_ - g.chin[1] - 0.35 * g.height) ** 2 / (0.6 * g.height) ** 2) < 1
+        holes &= (near | neck)
+        if holes.any():
+            # fill only from the person around it (hair and skin), never from the white backdrop
+            fill = _masked_blur(final, (person > 0.6).astype(np.float32), max(3.0, 0.012 * W))
+            hm = cv2.GaussianBlur(holes.astype(np.float32), (0, 0), 1.5)
+            final = final * (1 - hm[..., None]) + fill * hm[..., None]
+            # the filled area overlaps its neighbours a little, so no half-transparent seam is left between
+            cover = cv2.dilate(holes.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))).astype(np.float32)
+            person = np.maximum(person, cv2.GaussianBlur(cover, (0, 0), 1.0))
+            # pixels right round the filled gap that still carry the backdrop's white (edges of strands)
+            pale = np.clip((final.mean(-1) - fill.mean(-1) - 15) / 25, 0, 1) * cv2.GaussianBlur(cover, (0, 0), 1.0)
+            final = final * (1 - pale[..., None]) + fill * pale[..., None]
+        person = cv2.GaussianBlur(person, (0, 0), max(1.0, 0.0018 * W))
+        bd = backdrop(H, W, background)
+        # (no "light wrap": against a white backdrop it reads as a pale outline round the face)
+        final = final * person[..., None] + bd * (1 - person[..., None])
+        made = (1 - keep) * 1.0
+    else:
+        final[ai_clothes_only] = srcf[ai_clothes_only]
+        made = 1 - keep
+
+    # 5. One consistent camera grain over everything the AI made
+    n = min(photo_noise(src, src_lm) * 0.5, 1.6)  # low: the face itself was cleaned
+    if n > 0.3:
+        rng = np.random.default_rng(int(src[::97, ::89].sum()) % (2 ** 32))
+        gr = cv2.GaussianBlur(rng.normal(0, 1, (H, W)).astype(np.float32), (0, 0), 0.55)
+        final += (gr * (n / max(float(gr.std()), 1e-6)) * made)[..., None]
+    return _to_u8(final)
+
+
+def photo_noise(src: np.ndarray, lm: np.ndarray) -> float:
+    """Camera noise level of the photo (std of fine grain on the cheeks), for matching grain."""
+    gray = cv2.cvtColor(src, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    hf = gray - cv2.GaussianBlur(gray, (0, 0), 1.0)
+    m = cv2.erode(keep_mask(src.shape, lm), np.ones((9, 9), np.uint8)) > 0
+    if m.sum() < 200:
+        return 0.0
+    v = hf[m]
+    return float(np.clip(1.4826 * np.median(np.abs(v - np.median(v))), 0, 4.0))
 
 
 def backdrop(H: int, W: int, kind: str = "studio") -> np.ndarray:
@@ -503,6 +862,33 @@ def geom(lm: np.ndarray) -> FaceGeom:
     return FaceGeom(up=v / max(h, 1e-6), height=h, width=float(np.linalg.norm(lm[234] - lm[454])), chin=lm[CHIN])
 
 
+def make_room(rgb: np.ndarray, lm: np.ndarray, aspect: float = 2 / 3):
+    """Close selfies leave no room above the head (or below the chin) for a wig. Extend the canvas so a
+    full head-and-shoulders frame fits; the extension is a soft, blurred continuation that the AI repaints
+    (hair, top of the head, shoulders, backdrop). Returns (image, landmarks, valid) where valid is 1 on
+    real photo pixels and 0 on the added area."""
+    H, W = rgb.shape[:2]
+    g = geom(lm)
+    # Enough for the head with room above it, the hair and the shoulders; not a whole invented body.
+    box_h = 3.4 * g.height
+    box_w = box_h * aspect
+    cx = float(lm[FACE_OVAL][:, 0].mean())
+    top = float(lm[FOREHEAD][1]) - 1.2 * g.height
+    pt = int(np.ceil(max(0.0, -top)))
+    pb = int(np.ceil(max(0.0, top + box_h - H)))
+    pl = int(np.ceil(max(0.0, box_w / 2 - cx)))
+    pr = int(np.ceil(max(0.0, cx + box_w / 2 - W)))
+    valid = np.ones((H, W), np.uint8)
+    if max(pt, pb, pl, pr) == 0:
+        return rgb, lm, valid
+    big = cv2.copyMakeBorder(rgb, pt, pb, pl, pr, cv2.BORDER_REPLICATE)
+    valid = cv2.copyMakeBorder(valid, pt, pb, pl, pr, cv2.BORDER_CONSTANT, value=0)
+    soft = cv2.GaussianBlur(big, (0, 0), max(8.0, 0.04 * max(big.shape[:2])))
+    m = cv2.GaussianBlur((1 - valid).astype(np.float32), (0, 0), 6)[..., None]
+    big = np.clip(big * (1 - m) + soft * m, 0, 255).astype(np.uint8)
+    return big, lm + np.float32([pl, pt]), valid
+
+
 def head_crop(shape: tuple[int, int], lm: np.ndarray, aspect: float = 2 / 3) -> tuple[int, int, int, int]:
     """A portrait (w:h = aspect) box around the head with headroom for big styles. Returns x, y, w, h."""
     H, W = shape[:2]
@@ -561,7 +947,8 @@ def _poly_mask(shape, pts: np.ndarray, grow: int = 0, blur: float = 0) -> np.nda
     return m.astype(np.float32) / 255.0
 
 
-def beautify(rgb: np.ndarray, lm: np.ndarray, strength: float = 0.75, style: str | None = None) -> np.ndarray:
+def beautify(rgb: np.ndarray, lm: np.ndarray, strength: float = 0.75, style: str | None = None,
+             skin_extra: np.ndarray | None = None) -> np.ndarray:
     """Professional-style retouch that never moves or reshapes anything.
 
     Face recognition relies on the geometry and appearance of the eyes, brows, nose, mouth and
@@ -588,15 +975,22 @@ def beautify(rgb: np.ndarray, lm: np.ndarray, strength: float = 0.75, style: str
 
     img = rgb.astype(np.float32)
 
-    # 1. Skin smoothing: remove blemishes and unevenness (mid frequencies), keep fine texture.
-    base = cv2.bilateralFilter(rgb, d=0, sigmaColor=28, sigmaSpace=px(0.02))
-    base = cv2.bilateralFilter(base, d=0, sigmaColor=22, sigmaSpace=px(0.015)).astype(np.float32)
-    fine = img - cv2.GaussianBlur(img, (0, 0), max(0.8, 0.004 * fw))
-    smooth = cv2.GaussianBlur(base, (0, 0), max(0.6, 0.002 * fw)) + fine * 0.55
-    a = (skin * 0.85 * k)[..., None]
+    # 1. Skin smoothing by frequency separation (what professional retouchers use): blemishes and
+    #    unevenness live in the middle frequencies, so only those are softened; the broad shading and
+    #    the fine pore texture stay as they are. Blurs only average skin with skin (no halos from eyes,
+    #    brows, lips or hair). This can't flatten skin into patches or steps the way an edge-preserving
+    #    (bilateral) filter does on deep skin tones and enlarged photos.
+    w = np.clip(skin, 1e-3, 1)
+    s_hi, s_lo = max(0.8, 0.004 * fw), max(3.0, 0.025 * fw)
+    hi_blur = _masked_blur(img, w, s_hi)
+    lo_blur = _masked_blur(img, w, s_lo)
+    fine = img - hi_blur
+    mid = hi_blur - lo_blur
+    smooth = lo_blur + mid * (1 - 0.45 * k) + fine
+    a = skin[..., None]
     img = img * (1 - a) + smooth * a
 
-    lab = cv2.cvtColor(np.clip(img, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab = _lab(img)
     L, A, B = lab[..., 0], lab[..., 1], lab[..., 2]
 
     # 2. Even tone: pull local colour blotches toward the surrounding skin colour (overall tone unchanged).
@@ -621,26 +1015,33 @@ def beautify(rgb: np.ndarray, lm: np.ndarray, strength: float = 0.75, style: str
         L += face * 4.0 * k + under * 6.0 * k
 
     lab = np.stack([L, A, B], -1)
-    out = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB).astype(np.float32)
+    out = _rgb(lab)
 
     # 5. Crisper eyes, brows and lips; a touch of lip colour.
     sharp = out + (out - cv2.GaussianBlur(out, (0, 0), max(1.0, 0.006 * fw))) * 0.6 * k
     fm = (feats * face)[..., None]
     out = out * (1 - fm) + sharp * fm
     lips = _poly_mask(rgb.shape, lm[LIPS], blur=px(0.008))
-    hsv = cv2.cvtColor(np.clip(out, 0, 255).astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
-    hsv[..., 1] *= 1 + lips * 0.15 * k
-    out = cv2.cvtColor(np.clip(hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2RGB)
+    lab = _lab(out)
+    lab[..., 1:] = 128 + (lab[..., 1:] - 128) * (1 + lips * 0.12 * k)[..., None]
+    out = _rgb(lab)
     if (style or os.getenv("BEAUTY_STYLE", "glam")).lower() == "glam":
-        out = glam(out, lm, k, face, skin, feats, px)
-    return out
+        out = glam(out, lm, k, face, skin, feats, px, skin_extra)
+    # Put the real skin texture (pores, fine detail) back on top of the evened-out tone. Without it the
+    # skin turns smooth and painted, which is the clearest sign of a filtered/AI image.
+    o = out.astype(np.float32)
+    src_f = rgb.astype(np.float32)
+    ts = max(0.8, 0.0035 * fw)
+    tex = (src_f - cv2.GaussianBlur(src_f, (0, 0), ts)) - (o - cv2.GaussianBlur(o, (0, 0), ts))
+    o += tex * (skin * 0.7)[..., None]
+    return _to_u8(o)
 
 
 MOUTH_INNER = [78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308, 415, 310, 311, 312, 13, 82, 81, 80, 191]
 CHEEKS = [(50, 205), (280, 425)]  # (cheekbone, lower cheek) on each side
 
 
-def glam(rgb: np.ndarray, lm: np.ndarray, k: float, face, skin, feats, px) -> np.ndarray:
+def glam(rgb: np.ndarray, lm: np.ndarray, k: float, face, skin, feats, px, skin_extra=None) -> np.ndarray:
     """Beauty-filter look (like a Snapchat beauty lens) on top of the retouch, light and colour only:
     nothing is moved, enlarged or slimmed, so face recognition still matches the person.
       - extra-smooth, even, luminous skin with a soft glow
@@ -650,23 +1051,24 @@ def glam(rgb: np.ndarray, lm: np.ndarray, k: float, face, skin, feats, px) -> np
     H, W = rgb.shape[:2]
     img = rgb.astype(np.float32)
 
-    # 1. Second, softer smoothing pass on the skin only (keeps a little fine texture).
-    soft = cv2.bilateralFilter(rgb, d=0, sigmaColor=18, sigmaSpace=px(0.03)).astype(np.float32)
-    fine = img - cv2.GaussianBlur(img, (0, 0), max(0.8, 0.004 * px(1)))
-    soft = soft + fine * 0.3
-    a = (skin * 0.7 * k)[..., None]
-    img = img * (1 - a) + soft * a
+    # 1. A little more evening of mid-frequency unevenness (same frequency separation; texture kept).
+    w = np.clip(skin, 1e-3, 1)
+    hi_blur = _masked_blur(img, w, max(0.8, 0.004 * px(1)))
+    lo_blur = _masked_blur(img, w, max(3.0, px(0.03)))
+    img = img + (lo_blur - hi_blur) * (0.12 * k * skin)[..., None]
 
     # 2. Luminous skin: an exposure lift (multiplying R, G and B together keeps the skin's own colour
     #    and richness; adding brightness instead turns deep skin tones ashy and grey).
-    gain = 1 + face * 0.16 * k
+    # the neck and other visible skin get the same lift, so the face doesn't look brighter than the neck
+    tone = face if skin_extra is None else np.maximum(face, np.clip(skin_extra, 0, 1))
+    gain = 1 + tone * 0.11 * k
     img = 255 * (1 - (1 - np.clip(img / 255, 0, 1)) ** gain[..., None])  # lifts darker tones most, no clipping
 
-    lab = cv2.cvtColor(np.clip(img, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab = _lab(img)
     L, A, B = lab[..., 0], lab[..., 1], lab[..., 2]
     # richer, warmer skin colour (a healthy glow, never grey)
-    A += (A - 128) * skin * 0.15 * k + skin * 1.0 * k
-    B += (B - 128) * skin * 0.15 * k + skin * 2.5 * k
+    A += (A - 128) * tone * 0.1 * k + tone * 0.8 * k
+    B += (B - 128) * tone * 0.1 * k + tone * 1.8 * k
 
     # 3. Blush on the cheekbones.
     blush = np.zeros((H, W), np.float32)
@@ -674,8 +1076,8 @@ def glam(rgb: np.ndarray, lm: np.ndarray, k: float, face, skin, feats, px) -> np
         c = (lm[top] * 0.6 + lm[low] * 0.4)
         cv2.ellipse(blush, tuple(np.round(c).astype(int)), (px(0.11), px(0.07)), 0, 0, 360, 1.0, -1)
     blush = cv2.GaussianBlur(blush, (0, 0), px(0.05)) * skin
-    A += blush * 7 * k
-    L += blush * 1.5 * k
+    A += blush * 4 * k
+    L += blush * 1.0 * k
 
     # 4. Eyes: clearer whites (less red/yellow, a bit brighter), brighter irises.
     eyes = np.zeros((H, W), np.float32)
@@ -687,9 +1089,9 @@ def glam(rgb: np.ndarray, lm: np.ndarray, k: float, face, skin, feats, px) -> np
         white = eyes * np.clip((L - lthr) / 20, 0, 1) * np.clip((40 - chroma) / 20, 0, 1)
         A += (128 - A) * white * 0.5 * k
         B += (128 - B) * white * 0.5 * k
-        L += white * 12 * k
+        L += white * 8 * k
         iris = eyes * (1 - white)
-        L += iris * 6 * k
+        L += iris * 3 * k
 
     # 5. Teeth: whiter where the mouth is open and the pixels are bright.
     mouth = _poly_mask(rgb.shape, lm[MOUTH_INNER], blur=px(0.004))
@@ -702,24 +1104,22 @@ def glam(rgb: np.ndarray, lm: np.ndarray, k: float, face, skin, feats, px) -> np
 
     # 6. Lips: rosier and a little glossier.
     lips = _poly_mask(rgb.shape, lm[LIPS], blur=px(0.008)) * (1 - mouth)
-    A += lips * 6 * k
-    lthr = float(np.percentile(L[lips > 0.5], 90)) if (lips > 0.5).sum() > 20 else 255
-    L += lips * np.clip((L - lthr + 10) / 10, 0, 1) * 8 * k  # gloss on the existing highlights
+    A += lips * 3.5 * k  # a touch rosier; no added gloss (it looked artificial)
 
     lab = np.stack([L, A, B], -1)
-    out = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB).astype(np.float32)
+    out = _rgb(lab)
 
     # 7. Soft glow (bloom) over the face, screen-blended, never over the eye/lip detail.
     bloom = cv2.GaussianBlur(out, (0, 0), px(0.04))
     screen = 255 - (255 - out) * (255 - bloom) / 255
-    g = (face * (1 - feats * 0.8) * 0.12 * k)[..., None]
+    g = (face * (1 - feats * 0.8) * 0.06 * k)[..., None]
     out = out * (1 - g) + screen * g
 
     # 8. Keep eyes, brows and lashes crisp after all the softening.
     sharp = out + (out - cv2.GaussianBlur(out, (0, 0), max(1.0, 0.005 * px(1)))) * 0.5 * k
     fm = (feats * face)[..., None]
     out = out * (1 - fm) + sharp * fm
-    return np.clip(out, 0, 255).astype(np.uint8)
+    return np.clip(out, 0, 255)
 
 
 def _masked_blur(img: np.ndarray, weight: np.ndarray, sigma: float) -> np.ndarray:

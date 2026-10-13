@@ -116,22 +116,30 @@ export default function Camera({ onBack, onCapture, error }) {
           className={`absolute max-w-none object-cover ${frame ? "" : "inset-0 size-full"} ${facing === "user" ? "-scale-x-100" : ""}`}
         />
 
-        {/* Head guide: a big, forgiving outline over the real camera picture; everything else is dimmed */}
-        {frame && (
-          <div
-            className="pointer-events-none absolute rounded-[50%] border-2 border-dashed border-white/85 transition-all"
-            style={(() => {
-              const w = Math.min(frame.w * 0.7, frame.h * 0.5);
-              const h = w * 1.32;
-              return {
-                width: w, height: h,
-                left: frame.left + (frame.w - w) / 2,
-                top: frame.top + frame.h * 0.43 - h / 2,
-                boxShadow: "0 0 0 200vmax rgba(20,12,8,.5)",
-              };
-            })()}
-          />
-        )}
+        {/* Framing guide: head outline (with room above it) and a shoulder line below, sized so a natural
+            fit gives the head-and-shoulders photo the wig needs. Everything outside the head is softly dimmed. */}
+        {frame && (() => {
+          const w = Math.min(frame.w * 0.44, frame.h * 0.25);
+          const h = w * 1.3;
+          const cx = frame.left + frame.w / 2;
+          const cy = frame.top + frame.h * 0.36;
+          const sy = cy + h * 0.5 + h * 0.32;          // shoulder line
+          const sw = Math.min(frame.w * 0.92, w * 2.6);
+          return (
+            <>
+              <div
+                className="pointer-events-none absolute rounded-[50%] border-2 border-dashed border-white/90 transition-all"
+                style={{ width: w, height: h, left: cx - w / 2, top: cy - h / 2, boxShadow: "0 0 0 200vmax rgba(20,12,8,.38)" }}
+              />
+              <svg className="pointer-events-none absolute inset-0 size-full">
+                <path
+                  d={`M ${cx - sw / 2} ${sy + h * 0.55} Q ${cx - sw / 2} ${sy} ${cx - w * 0.45} ${sy - h * 0.06} L ${cx + w * 0.45} ${sy - h * 0.06} Q ${cx + sw / 2} ${sy} ${cx + sw / 2} ${sy + h * 0.55}`}
+                  fill="none" stroke="white" strokeOpacity=".9" strokeWidth="2" strokeDasharray="7 6"
+                />
+              </svg>
+            </>
+          );
+        })()}
       </div>
 
       {/* Top bar */}
@@ -146,8 +154,8 @@ export default function Camera({ onBack, onCapture, error }) {
 
       {/* Tips */}
       <div className="absolute inset-x-0 bottom-32 safe-bottom px-6 text-center">
-        <p className="font-display text-2xl">Your head in the outline</p>
-        <p className="mt-1 text-sm text-white/80">It doesn't have to be exact. Hold the phone at arm's length so the top of your head shows, look straight ahead, good light. If you can, pull your hair or fringe back off your face.</p>
+        <p className="font-display text-2xl">Head and shoulders in view</p>
+        <p className="mt-1 text-sm text-white/80">Hold the phone at arm's length: your whole head inside the outline with space above it, shoulders on the line. Look straight ahead, good light, hair or fringe off your face if you can.</p>
         {error && <p className="mx-auto mt-3 max-w-xs rounded-2xl bg-red-500/90 px-4 py-2 text-sm">{error}</p>}
       </div>
 

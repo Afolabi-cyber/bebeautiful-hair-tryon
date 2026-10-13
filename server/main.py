@@ -23,7 +23,7 @@ import catalog_store
 import db
 from status import STATUS
 from admin import router as admin_router
-from faces import HAIR, FaceTool, Segmenter, hair_zone, head_crop, keep_mask, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
+from faces import HAIR, FaceTool, backdrop, clothes_keep, compose_ai, make_room, Segmenter, hair_zone, head_crop, keep_mask, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -32,6 +32,10 @@ MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1.5")
 QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "high")  # low | medium | high
 # Background of the result: studio (clean light backdrop), white, or original (the customer's own)
 RESULT_BACKGROUND = os.getenv("RESULT_BACKGROUND", "studio").lower()
+# "ai" (default): the AI renders the whole head (face, hair, light and shadows together, lightly
+# beautified); the face is then locked back to the customer's exact shape and features and her clothes
+# always come from her photo. "photo": her original face and photo with only the AI hair laid on top.
+BLEND_MODE = os.getenv("BLEND_MODE", "ai").strip().lower()
 FACE_ENHANCE = min(1.0, max(0.0, float(os.getenv("FACE_ENHANCE", "0.75"))))  # retouch strength: 0 = off, 0.75 = default, 1 = strongest
 OUT_W, OUT_H = 1024, 1536
 MAX_UPLOAD = 15 * 1024 * 1024
@@ -149,6 +153,36 @@ def build_prompt(p: dict) -> str:
         "and fit. Do not darken, recolour, replace or cover the clothes with anything except the wig's "
         "hair where it naturally falls in front of the shoulders and chest. Keep the body, pose, "
         "background and framing exactly as in image 1. Photorealistic."
+    )
+
+
+def build_prompt_ai(p: dict) -> str:
+    desc = p.get("description") or p["name"]
+    return (
+        "Image 1 is a photo of a customer. Image 2 is a product photo of a wig on a plain background, "
+        "shown from the front with the face area empty.\n"
+        f"Wig: {desc}.\n"
+        "Make a beautiful, natural, photorealistic portrait of the customer from image 1 wearing this exact wig. "
+        "Reproduce the wig from image 2 faithfully: the same braid size and pattern, the same parting, the same "
+        "curl type and where the curls start, the same colours and ombre in the same places, the same length, "
+        "density and volume. Do not invent a different hairstyle.\n"
+        "The wig must look like it is really on her head: installed flush and snug on the scalp with a natural, "
+        "soft hairline that blends into her forehead and temples, no visible lace, cap or edges, the top close "
+        "to the scalp, the hair falling naturally around the face and over the shoulders and covering both ears "
+        "completely, the same on the left and the right (do not draw any ears), "
+        "with the hair casting soft natural shadows where it touches the forehead, cheeks, neck and shoulders. "
+        "Hide all of her own hair, scarf or cap completely under the wig. The light on the face, hair and "
+        "clothes must match, as in one real photograph.\n"
+        "Gently beautify her face the way a professional retoucher and makeup artist would, keeping it natural: "
+        "even skin tone, smooth out blemishes, spots and dark circles, a soft healthy glow, neat brows, subtle "
+        "natural lip colour. Keep real skin texture, never plastic or painted. She must stay unmistakably the "
+        "same person: exactly the same face shape, eyes, eye shape and spacing, eyebrow shape, nose, lips, "
+        "jawline, age and expression, and exactly the same skin tone (do not lighten or darken her skin). "
+        "Do not add anything that is not in image 1: no glasses, earrings, jewellery or accessories she is not "
+        "already wearing. If she wears glasses or a necklace, keep them exactly as they are.\n"
+        "Keep her clothing exactly as in image 1: the same garment, colour, pattern, neckline and fit. Keep the "
+        "same pose, head size, position and framing as image 1. Replace the background with a plain, seamless, "
+        "softly lit light grey-white studio backdrop. Shot on a good camera, photorealistic, not an illustration."
     )
 
 
@@ -300,8 +334,13 @@ async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
     lm = await landmarks(rgb)
     if lm is None:
         raise HTTPException(422, "We couldn't find a face in your photo. Please retake it.")
+    # Close selfies: extend the canvas so there's room for the full wig above the head and the shoulders
+    rgb, lm, valid = make_room(rgb, lm, OUT_W / OUT_H)
     x, y, w, h = head_crop(rgb.shape, lm, OUT_W / OUT_H)
-    crop = cv2.resize(rgb[y:y + h, x:x + w], (OUT_W, OUT_H), interpolation=cv2.INTER_AREA)
+    # INTER_AREA only for shrinking; enlarging with it duplicates pixels into visible blocks
+    crop = cv2.resize(rgb[y:y + h, x:x + w], (OUT_W, OUT_H),
+                      interpolation=cv2.INTER_AREA if w >= OUT_W else cv2.INTER_LANCZOS4)
+    added = cv2.resize(valid[y:y + h, x:x + w], (OUT_W, OUT_H), interpolation=cv2.INTER_NEAREST) == 0
     lm = (lm - [x, y]) * [OUT_W / w, OUT_H / h]
     bangs = bool(p.get("bangs"))
 
@@ -318,6 +357,9 @@ async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
     # seat the wig flush instead of leaving old hair (or a gap) next to it. The face stays locked.
     try:
         seg_src = await segment(crop)
+        if seg_src is not None and added.any():
+            seg_src[added] = 0
+            seg_src[added, 0] = 1  # the added area is not part of her photo: nothing of hers is there
     except Exception:
         log.exception("Hair model failed on this photo")
         seg_src = None
@@ -327,11 +369,20 @@ async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
         own = cv2.dilate(own, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * g + 1, 2 * g + 1)))
         zone = np.maximum(zone, own)
         zone[skin_lock(seg_src, lm, bangs) > 0] = 0  # her real forehead/temples: the wig is built around them
+    ai_mode = BLEND_MODE == "ai" and seg_src is not None
+    if ai_mode:
+        # The AI may repaint everything (face, hair, background) except her clothes.
+        cl = (clothes_keep(seg_src, lm) > 0.5).astype(np.uint8)
+        e = max(2, int(0.01 * OUT_W))
+        cl = cv2.erode(cl, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * e + 1, 2 * e + 1)))
+        edit_mask, prompt = (cl * 255).astype(np.uint8), build_prompt_ai(p)
+    else:
+        edit_mask, prompt = (zone == 0).astype(np.uint8) * 255, build_prompt(p)
     kwargs = dict(
         model=MODEL,
         image=[("customer.png", encode(crop), "image/png"), ("wig.png", encode(wig_rgb), "image/png")],
-        mask=("mask.png", openai_mask_png((zone == 0).astype(np.uint8) * 255), "image/png"),
-        prompt=build_prompt(p),
+        mask=("mask.png", openai_mask_png(edit_mask), "image/png"),
+        prompt=prompt,
         size=f"{OUT_W}x{OUT_H}",
         quality=QUALITY,
         output_format="png",
@@ -366,16 +417,28 @@ async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
         seg_src = seg_out = None
     if seg_out is None and not ALLOW_WITHOUT_HAIR_MODEL:
         raise HTTPException(502, "We couldn't finish this look. Please try again.")
+    out_final, mode = None, ""
     try:
-        out_final = transfer_hair(crop, lm, out, out_lm, zone, seg_src, seg_out, FACE_ENHANCE, RESULT_BACKGROUND)
+        if ai_mode and seg_out is not None:
+            out_final = compose_ai(crop, lm, out, out_lm, seg_src, seg_out, RESULT_BACKGROUND, src_scale=w / OUT_W,
+                                   enhance=FACE_ENHANCE, added=added)
+            mode = "ai blend"
+        if out_final is None:
+            # AI face couldn't be matched to her photo reliably: use her own face with the AI hair
+            out_final = transfer_hair(crop, lm, out, out_lm, zone, seg_src, seg_out, FACE_ENHANCE, RESULT_BACKGROUND,
+                                      src_scale=w / OUT_W)
+            mode = ("photo blend (fallback)" if ai_mode else "fence + hair model") if seg_out is not None else "fence only"
     except Exception:
         log.exception("Final composite failed")
         # Never fall back to the raw AI image (it may have changed the clothes).
         raise HTTPException(502, "We couldn't finish this look. Please try again.")
-    mode = "fence + hair model" if seg_out is not None else "fence only"
     out, locked = out_final, True
     log.info("try-on finished: mode=%s", mode)
-    return {"before": crop, "after": out, "locked": locked, "mode": mode}
+    before = crop
+    if added.any():  # the "before" picture shows the clean backdrop where the canvas was extended
+        a_ = cv2.GaussianBlur(added.astype(np.float32), (0, 0), 3)[..., None]
+        before = np.clip(crop * (1 - a_) + backdrop(OUT_H, OUT_W, "studio") * a_, 0, 255).astype(np.uint8)
+    return {"before": before, "after": out, "locked": locked, "mode": mode}
 
 
 app.mount("/wigs", StaticFiles(directory=catalog_store.WIGS), name="wigs")
