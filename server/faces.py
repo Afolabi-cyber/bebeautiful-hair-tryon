@@ -1333,7 +1333,7 @@ def restore_clothes(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_o
 
 
 def keep_body(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np.ndarray,
-              M: np.ndarray, inset: int = 1) -> tuple[np.ndarray, str]:
+              M: np.ndarray, inset: int = 1, follow: bool = False) -> tuple[np.ndarray, str]:
     """Her own body and clothes, always, by construction (whatever the AI drew there).
 
     The AI's picture supplies only the new hair, the head and the backdrop. Her real clothes, arms,
@@ -1347,6 +1347,20 @@ def keep_body(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np
     body = np.clip(seg_w[..., CLOTHES] + seg_w[..., BODY_SKIN], 0, 1)
     near = cv2.dilate((body > 0.5).astype(np.uint8), np.ones((int(0.05 * W) | 1,) * 2, np.uint8)).astype(np.float32)
     body = np.clip(body + seg_w[..., OTHERS] * near, 0, 1)  # bags, straps, jewellery on her
+    # Light or shiny garments (a white top under a jacket, satin) are often missed by the segmenter and
+    # come out as holes in her body. Close small gaps and fill enclosed holes, so they stay hers instead
+    # of turning into backdrop. Large enclosed areas (real background between arm and body) stay open.
+    bb = (body > 0.5).astype(np.uint8)
+    k = int(0.02 * W) | 1
+    bb = cv2.morphologyEx(bb, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    inv = (1 - bb).astype(np.uint8)
+    n, lab_, stats, _ = cv2.connectedComponentsWithStats(inv, connectivity=4)
+    for i in range(1, n):
+        x, y, w_, h_, area = stats[i]
+        touches = x == 0 or y == 0 or x + w_ >= W or y + h_ >= H
+        if not touches and area < 0.04 * H * W:
+            bb[lab_ == i] = 1
+    body = np.maximum(body, bb.astype(np.float32) * 0.99)
     if (body > 0.5).sum() < 1500:
         return out, "no body to keep"
     old_hair = seg_w[..., HAIR]
@@ -1371,7 +1385,9 @@ def keep_body(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np
     was_bg = (body < 0.3) & (old_hair < 0.3) & (seg_w[..., FACE_SKIN] < 0.3)
     invented = ((ai_body > 0.5) & was_bg & (new_hair < 0.35)).astype(np.uint8)
     invented = cv2.morphologyEx(invented, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    if invented.any() and inset <= 1:
+    # follow = the AI re-posed her: keep its pose (her arms where it put them), so nothing of her old
+    # pose is pasted where the result has no body (no floating sleeves or hands)
+    if invented.any() and inset <= 1 and not follow:
         bgm = cv2.erode((seg_out[..., BG] > 0.7).astype(np.uint8), np.ones((7, 7), np.uint8)).astype(np.float32)
         sig = max(8.0, 0.08 * W)
         num = cv2.GaussianBlur(out.astype(np.float32) * bgm[..., None], (0, 0), sig)
@@ -1388,6 +1404,40 @@ def keep_body(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np
     keep = cv2.erode((body > 0.5).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (e, e))).astype(np.float32)
     g = 2 * max(2, inset // 2) + 1
     block = cv2.dilate((new_hair > 0.35).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (g, g)))
+    if follow:
+        there = cv2.dilate((ai_body > 0.5).astype(np.uint8), np.ones((5, 5), np.uint8)).astype(np.float32)
+        keep *= there
     keep = cv2.GaussianBlur(keep * (1 - block), (0, 0), max(1.0, inset / 2.5))[..., None]
     res = src_w * keep + res * (1 - keep)
     return _to_u8(res), f"kept ({float(keep.mean()) * 100:.0f}% of picture, {int(invented.sum())} invented px removed)"
+
+
+def tidy_body(out: np.ndarray, seg: np.ndarray) -> tuple[np.ndarray, int]:
+    """Last safety net on the finished picture: any piece of clothing or skin that floats on its own,
+    not joined to her body (a stray sleeve, a hand left from an old pose, a patch at the edge), is
+    replaced with the backdrop. Her body, face and the hair are never touched. Returns (image, pieces)."""
+    H, W = out.shape[:2]
+    person = np.clip(seg[..., CLOTHES] + seg[..., BODY_SKIN] + seg[..., FACE_SKIN] + seg[..., HAIR]
+                     + seg[..., OTHERS], 0, 1) > 0.5
+    n, lab_, stats, _ = cv2.connectedComponentsWithStats(person.astype(np.uint8), connectivity=8)
+    if n <= 2:
+        return out, 0
+    face = seg[..., FACE_SKIN] > 0.5
+    main = max(range(1, n), key=lambda i: (face[lab_ == i].sum(), stats[i][4]))  # the piece with her face
+    stray = np.zeros((H, W), np.uint8)
+    for i in range(1, n):
+        if i != main and stats[i][4] < 0.06 * H * W:
+            stray[lab_ == i] = 1
+    stray &= ((seg[..., HAIR] < 0.35)).astype(np.uint8)  # loose curls are allowed to float
+    if not stray.any():
+        return out, 0
+    bgm = cv2.erode((seg[..., BG] > 0.7).astype(np.uint8), np.ones((7, 7), np.uint8)).astype(np.float32)
+    sig = max(8.0, 0.08 * W)
+    num = cv2.GaussianBlur(out.astype(np.float32) * bgm[..., None], (0, 0), sig)
+    den = cv2.GaussianBlur(bgm, (0, 0), sig)[..., None]
+    fallback = np.median(out[bgm > 0], axis=0).astype(np.float32) if bgm.sum() > 500 else np.float32([225, 225, 225])
+    plate = np.where(den > 0.05, num / np.maximum(den, 1e-3), fallback)
+    a = cv2.GaussianBlur(cv2.dilate(stray, np.ones((9, 9), np.uint8)).astype(np.float32), (0, 0), 2.5)
+    a = (a * (1 - np.clip((seg[..., HAIR] - 0.2) / 0.3, 0, 1)))[..., None]
+    res = out.astype(np.float32) * (1 - a) + plate * a
+    return _to_u8(res), int(n - 2)
