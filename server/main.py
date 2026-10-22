@@ -23,7 +23,7 @@ import catalog_store
 import db
 from status import STATUS
 from admin import router as admin_router
-from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, keep_body, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
+from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, keep_body, tidy_body, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -43,6 +43,9 @@ BLEND_MODE = os.getenv("BLEND_MODE", "pure").strip().lower()
 # on = a result whose clothes could not be kept is never shown (she is asked for a clearer photo)
 # on = one extra AI retouch so the wig, her body and the backdrop blend into one photo (adds one AI call)
 BLEND_PASS = os.getenv("BLEND_PASS", "on").lower() not in ("0", "off", "false", "no")
+# the blend pass only runs when the AI's body/clothes matched hers less than this (0..1); it runs at this quality
+BLEND_BELOW = float(os.getenv("BLEND_BELOW", "0.75"))
+BLEND_QUALITY = os.getenv("BLEND_QUALITY", "medium")
 CLOTHES_STRICT = os.getenv("CLOTHES_STRICT", "on").lower() not in ("0", "off", "false", "no")
 KEEP_CLOTHES = os.getenv("KEEP_CLOTHES", "on").lower() not in ("0", "off", "false", "no")
 KEEP_FACE = os.getenv("KEEP_FACE", "on").lower() not in ("0", "off", "false", "no")
@@ -488,13 +491,14 @@ async def describe_outfit(crop: np.ndarray) -> str:
         return ""
 
 
-async def ai_edit(crop: np.ndarray, wig_rgb: np.ndarray, prompt: str, keep: np.ndarray | None = None) -> np.ndarray:
+async def ai_edit(crop: np.ndarray, wig_rgb: np.ndarray, prompt: str, keep: np.ndarray | None = None,
+                  quality: str | None = None) -> np.ndarray:
     kwargs = dict(
         model=MODEL,
         image=[("customer.png", encode(crop), "image/png"), ("wig.png", encode(wig_rgb), "image/png")],
         prompt=prompt,
         size=f"{OUT_W}x{OUT_H}",
-        quality=QUALITY,
+        quality=quality or QUALITY,
         output_format="png",
         n=1,
     )
@@ -529,7 +533,7 @@ async def blend_pass(comp: np.ndarray, sent: np.ndarray, lm: np.ndarray, seg_src
         body = cv2.erode(body, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * inner + 1,) * 2))
         hair = cv2.dilate((c_seg[..., HAIR] > 0.3).astype(np.uint8), np.ones((inner, inner), np.uint8))
         keep = np.maximum((body * (1 - hair)) * 255, keep_mask(comp.shape, c_lm, shrink=0.85)).astype(np.uint8)
-        out2 = await ai_edit(comp, wig_rgb, build_prompt_blend(p, outfit), keep=keep)
+        out2 = await ai_edit(comp, wig_rgb, build_prompt_blend(p, outfit), keep=keep, quality=BLEND_QUALITY)
         o_lm = await landmarks(out2)
         o_seg = await segment(out2)
         M2 = align(lm, o_lm) if o_lm is not None else None
@@ -541,7 +545,7 @@ async def blend_pass(comp: np.ndarray, sent: np.ndarray, lm: np.ndarray, seg_src
         if KEEP_FACE:
             out2, _ = face_lock(sent, lm, out2, o_lm, bool(p.get("bangs")), enhance=0, relight=0.4)
         if KEEP_CLOTHES:
-            out2, how = keep_body(sent, seg_src, out2, o_seg, M2, inset=max(4, int(0.012 * W)))
+            out2, how = keep_body(sent, seg_src, out2, o_seg, M2, inset=max(4, int(0.012 * W)), follow=True)
             log.info("blend pass: her clothes %s", how)
         return out2
     except HTTPException:
@@ -608,7 +612,15 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
         if M is None and out_lm is not None:
             M = align(lm, out_lm, strict=False)
         if M is not None:
-            out, how = keep_body(sent, seg_src, out, seg_out, M)
+            # How far the AI moved away from her real body/clothes. Close (most photos): her clothes go
+            # on with invisible seams and no extra AI call. Far (it re-posed her): one AI blend pass.
+            fit = garment_fit(sent, seg_src, out, seg_out, M)
+            needs_blend = fit is not None and fit[2] < BLEND_BELOW
+            # re-posed: follow the AI's pose (her clothes where the two bodies overlap, her colours on the
+            # rest), then the blend pass; otherwise her real body exactly where it was in her photo
+            follow = needs_blend and BLEND_PASS
+            out, how = keep_body(sent, seg_src, out, seg_out, M, follow=follow)
+            how += f", match {fit[2]:.2f}" if fit is not None else ""
         else:
             out, how = restore_clothes(crop, seg_src, out, seg_out, None)
             if CLOTHES_STRICT and not (how.startswith("kept") or how.startswith("no clothes")):
@@ -617,8 +629,18 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
         log.info("her own clothes: %s", how)
         # One AI retouch over the assembled picture so hair, body and backdrop become one photo (her face
         # and the inside of her clothes are protected, and both are put back exactly afterwards).
-        if BLEND_PASS and M is not None:
+        if BLEND_PASS and M is not None and needs_blend:
             out = await blend_pass(out, sent, lm, seg_src, wig_rgb, p, outfit)
+    # Safety net: no floating pieces of clothing or skin left anywhere on the finished picture
+    if seg_src is not None:
+        try:
+            seg_f = await segment(out)
+            if seg_f is not None:
+                out, pieces = tidy_body(out, seg_f)
+                if pieces:
+                    log.info("tidied %d stray piece(s)", pieces)
+        except Exception:
+            log.exception("tidy step skipped")
     before = crop
     if added is not None and added.any():
         a_ = cv2.GaussianBlur(added.astype(np.float32), (0, 0), 3)[..., None]
