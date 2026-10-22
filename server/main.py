@@ -199,8 +199,11 @@ def build_prompt_pure(p: dict, retry_note: str = "", outfit: str = "") -> str:
     return (
         "Image 1 is a photo of a customer. Image 2 is a product photo of a wig (shown on its own, face area empty).\n"
         f"Wig: {desc}.\n\n"
-        "Create ONE finished, photorealistic portrait of the customer from image 1 wearing this exact wig, as if "
-        "photographed in a professional studio. It must look like a real photograph, never like a collage or an edit.\n\n"
+        "EDIT image 1. Change only two things: her hair becomes this exact wig, and the background becomes a plain "
+        "studio backdrop. Everything else in image 1 stays exactly as it is, as if the same photo had been taken again: "
+        "her face, her body, her pose, her hands and arms, her clothes and jewellery, their position, size and "
+        "lighting. Do not re-imagine, re-pose or re-shoot her. The result must look like a real photograph, never like "
+        "a collage.\n\n"
         "THE WIG: reproduce image 2 faithfully: the same braid size and pattern, parting, curl type and where the curls "
         "start, the same colours and ombre in the same places, the same length, density and fullness. Do not invent a "
         "different style. Fit it like a professionally installed wig: flush and snug on the scalp, the top close to the "
@@ -218,9 +221,9 @@ def build_prompt_pure(p: dict, retry_note: str = "", outfit: str = "") -> str:
         "and fit, and keep any necklace. Never invent, replace or restyle her clothes, and never add a pattern or print. "
         + (f"She is wearing: {outfit}. It must stay exactly that. " if outfit else "")
         + "The wig's hair may fall in front of the clothes.\n\n"
-        "THE PHOTO: soft, even studio light that is the same on the face, hair, neck and clothes and keeps her real skin tone. A plain, "
-        "seamless, softly lit light grey-white studio backdrop that fills the whole frame edge to edge, with nothing of her original room (walls, ceiling, lights, furniture) left anywhere. Head-and-shoulders "
-        "framing as in image 1. If any part of image 1 is blurred or empty at the edges, fill it only with the hair and "
+        "THE PHOTO: keep the light on her as it is in image 1 and light the new hair to match it. A plain, "
+        "seamless, softly lit light grey-white studio backdrop that fills the whole frame edge to edge, with nothing of her original room (walls, ceiling, lights, furniture) left anywhere. Exactly the "
+        "same framing and pose as image 1 (if her hands are near her face or she leans on something, keep that). If any part of image 1 is blurred or empty at the edges, fill it only with the hair and "
         "the backdrop. Never extend or invent her body or clothes: no shoulders, arms, sleeves or chest that are not "
         "visible in image 1, and the same neckline and collar. Sharp, clean, high quality, photorealistic."
         + (f"\n\nIMPORTANT, previous attempt failed: {retry_note}" if retry_note else "")
