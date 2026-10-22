@@ -248,11 +248,13 @@ def build_prompt_blend(p: dict, outfit: str = "") -> str:
         "pattern and fabric), her jewellery, her pose, arms and hands. Only fix how the parts meet:\n"
         "- the wig sits naturally on her head and falls naturally over her shoulders, arms and clothes, with soft, "
         "natural strand edges and soft contact shadows where hair touches her and her clothes;\n"
+        "- her hands and arms stay exactly where and how they are in image 1 (same position, same fingers, same "
+        "gesture): do not move, add, remove or re-pose any hand or arm;\n"
         "- where hair and hands or arms overlap, it looks physically right;\n"
         "- the outline of her body and clothes against the backdrop is clean and natural: no cut-out edges, halos, "
         "white or grey patches, holes or leftover pieces; any hole or gap in her clothes is filled with the same fabric;\n"
-        "- if her arms rest on something that is not in the picture, or her body is cut off, finish it naturally "
-        "(for example arms resting on a plain surface at the bottom of the frame);\n"
+        "- if her arms rest on something that is not in the picture, add a plain surface under them at the bottom "
+        "of the frame, without moving the arms;\n"
         "- one consistent light on her, the hair and the backdrop, keeping her real skin tone.\n"
         + (f"She is wearing: {outfit}. Her clothes must stay exactly that. " if outfit else "")
         + "Plain, seamless, light grey-white studio backdrop. Do not add or change anything else. Photorealistic."
@@ -545,7 +547,7 @@ async def blend_pass(comp: np.ndarray, sent: np.ndarray, lm: np.ndarray, seg_src
         if KEEP_FACE:
             out2, _ = face_lock(sent, lm, out2, o_lm, bool(p.get("bangs")), enhance=0, relight=0.4)
         if KEEP_CLOTHES:
-            out2, how = keep_body(sent, seg_src, out2, o_seg, M2, inset=max(4, int(0.012 * W)), follow=True)
+            out2, how = keep_body(sent, seg_src, out2, o_seg, M2, inset=max(4, int(0.012 * W)))
             log.info("blend pass: her clothes %s", how)
         return out2
     except HTTPException:
@@ -616,10 +618,9 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
             # on with invisible seams and no extra AI call. Far (it re-posed her): one AI blend pass.
             fit = garment_fit(sent, seg_src, out, seg_out, M)
             needs_blend = fit is not None and fit[2] < BLEND_BELOW
-            # re-posed: follow the AI's pose (her clothes where the two bodies overlap, her colours on the
-            # rest), then the blend pass; otherwise her real body exactly where it was in her photo
-            follow = needs_blend and BLEND_PASS
-            out, how = keep_body(sent, seg_src, out, seg_out, M, follow=follow)
+            # Always her real pose: her arms and hands exactly where they are in her photo. Whatever the AI
+            # drew elsewhere (moved hands, extra arms) becomes backdrop; the blend pass smooths the result.
+            out, how = keep_body(sent, seg_src, out, seg_out, M)
             how += f", match {fit[2]:.2f}" if fit is not None else ""
         else:
             out, how = restore_clothes(crop, seg_src, out, seg_out, None)
