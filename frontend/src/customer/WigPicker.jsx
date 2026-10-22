@@ -11,7 +11,7 @@ export default function WigPicker({
   return (
     <div className="flex h-full flex-col">
       {/* Header */}
-      <header className="safe-top px-5 pb-3 bg-cream/90 backdrop-blur-md z-10">
+      <header className="safe-top px-5 pt-3 pb-3 bg-cream/90 backdrop-blur-md z-10">
         <div className="flex items-center gap-3">
           <button onClick={onRetake} className="relative shrink-0" aria-label="Retake photo">
             {selfie ? (

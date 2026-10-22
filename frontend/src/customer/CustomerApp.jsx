@@ -94,13 +94,9 @@ export default function CustomerApp() {
     setSessionId(res.sessionId);
     setLooks([]);
     setDraft(null);
-    if (preset) {
-      // Came from a product page: the wig is already chosen, so start making the look straight away.
-      setWigId(preset);
-      tryOn(preset, res.sessionId, []);
-    } else {
-      setScreen("pick"); // no style chosen yet: she picks one here
-    }
+    // She always gets to choose: the wig from the product page is preselected and shown first.
+    setWigId(preset || null);
+    setScreen("pick");
   }
 
   async function tryOn(id = wigId, sid = sessionId, have = looks) {
@@ -148,7 +144,7 @@ export default function CustomerApp() {
         brand={brand}
         customer={customer}
         selfie={selfie}
-        products={products}
+        products={preset ? [product(preset), ...products.filter((p) => p.id !== preset)].filter(Boolean) : products}
         selected={wigId}
         tried={new Set(looks.map((l) => l.wigId))}
         onSelect={setWigId}
