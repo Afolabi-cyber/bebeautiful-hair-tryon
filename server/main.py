@@ -41,6 +41,8 @@ BLEND_MODE = os.getenv("BLEND_MODE", "pure").strip().lower()
 # 1 = the result keeps her exact skin tone, 0 = whatever the AI drew
 # on = her real face (smoothed only) is used in the result, never the AI redraw of it
 # on = a result whose clothes could not be kept is never shown (she is asked for a clearer photo)
+# on = one extra AI retouch so the wig, her body and the backdrop blend into one photo (adds one AI call)
+BLEND_PASS = os.getenv("BLEND_PASS", "on").lower() not in ("0", "off", "false", "no")
 CLOTHES_STRICT = os.getenv("CLOTHES_STRICT", "on").lower() not in ("0", "off", "false", "no")
 KEEP_CLOTHES = os.getenv("KEEP_CLOTHES", "on").lower() not in ("0", "off", "false", "no")
 KEEP_FACE = os.getenv("KEEP_FACE", "on").lower() not in ("0", "off", "false", "no")
@@ -229,6 +231,28 @@ def build_prompt_pure(p: dict, retry_note: str = "", outfit: str = "") -> str:
         "the backdrop. Never extend or invent her body or clothes: no shoulders, arms, sleeves or chest that are not "
         "visible in image 1, and the same neckline and collar. Sharp, clean, high quality, photorealistic."
         + (f"\n\nIMPORTANT, previous attempt failed: {retry_note}" if retry_note else "")
+    )
+
+
+def build_prompt_blend(p: dict, outfit: str = "") -> str:
+    desc = p.get("description") or p["name"]
+    return (
+        "Image 1 is a try-on photo of a customer wearing a new wig. It was put together from parts (her real photo "
+        "and the new hair), so the parts may not sit together naturally yet. Image 2 is the wig on its own for "
+        f"reference. Wig: {desc}.\n\n"
+        "Retouch image 1 into ONE seamless, natural photograph. Keep everything exactly where and as it is: her face, "
+        "the wig (same style, braids, curls, colours, length and position), her clothes (the same garment, colour, "
+        "pattern and fabric), her jewellery, her pose, arms and hands. Only fix how the parts meet:\n"
+        "- the wig sits naturally on her head and falls naturally over her shoulders, arms and clothes, with soft, "
+        "natural strand edges and soft contact shadows where hair touches her and her clothes;\n"
+        "- where hair and hands or arms overlap, it looks physically right;\n"
+        "- the outline of her body and clothes against the backdrop is clean and natural: no cut-out edges, halos, "
+        "white or grey patches, holes or leftover pieces; any hole or gap in her clothes is filled with the same fabric;\n"
+        "- if her arms rest on something that is not in the picture, or her body is cut off, finish it naturally "
+        "(for example arms resting on a plain surface at the bottom of the frame);\n"
+        "- one consistent light on her, the hair and the backdrop, keeping her real skin tone.\n"
+        + (f"She is wearing: {outfit}. Her clothes must stay exactly that. " if outfit else "")
+        + "Plain, seamless, light grey-white studio backdrop. Do not add or change anything else. Photorealistic."
     )
 
 
@@ -491,6 +515,43 @@ async def ai_edit(crop: np.ndarray, wig_rgb: np.ndarray, prompt: str, keep: np.n
     return out
 
 
+async def blend_pass(comp: np.ndarray, sent: np.ndarray, lm: np.ndarray, seg_src, wig_rgb: np.ndarray,
+                     p: dict, outfit: str) -> np.ndarray:
+    """AI retouch of the assembled result; returns the assembled one if anything goes wrong."""
+    try:
+        c_lm = await landmarks(comp)
+        c_seg = await segment(comp)
+        if c_lm is None or c_seg is None:
+            return comp
+        H, W = comp.shape[:2]
+        inner = max(6, int(0.02 * W))
+        body = (np.clip(c_seg[..., CLOTHES] + c_seg[..., BODY_SKIN], 0, 1) > 0.5).astype(np.uint8)
+        body = cv2.erode(body, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * inner + 1,) * 2))
+        hair = cv2.dilate((c_seg[..., HAIR] > 0.3).astype(np.uint8), np.ones((inner, inner), np.uint8))
+        keep = np.maximum((body * (1 - hair)) * 255, keep_mask(comp.shape, c_lm, shrink=0.85)).astype(np.uint8)
+        out2 = await ai_edit(comp, wig_rgb, build_prompt_blend(p, outfit), keep=keep)
+        o_lm = await landmarks(out2)
+        o_seg = await segment(out2)
+        M2 = align(lm, o_lm) if o_lm is not None else None
+        if M2 is None or o_seg is None:
+            log.info("blend pass: result not usable, keeping the assembled picture")
+            return comp
+        if SKIN_TONE > 0 and seg_src is not None:
+            out2 = keep_skin_tone(sent, seg_src, out2, o_seg, SKIN_TONE, exact=KEEP_FACE)
+        if KEEP_FACE:
+            out2, _ = face_lock(sent, lm, out2, o_lm, bool(p.get("bangs")), enhance=0, relight=0.4)
+        if KEEP_CLOTHES:
+            out2, how = keep_body(sent, seg_src, out2, o_seg, M2, inset=max(4, int(0.012 * W)))
+            log.info("blend pass: her clothes %s", how)
+        return out2
+    except HTTPException:
+        log.warning("blend pass failed at the AI; keeping the assembled picture")
+        return comp
+    except Exception:
+        log.exception("blend pass failed; keeping the assembled picture")
+        return comp
+
+
 async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dict, seg_src, added,
                    src_scale: float = 1.0) -> dict:
     """The AI makes the final picture. The server only checks it (same person, same clothes, face in
@@ -554,6 +615,10 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
                 raise HTTPException(422, "We couldn't keep your outfit exactly as it is in this photo. Please take a "
                                          "new photo facing the camera, with your head and shoulders in view.")
         log.info("her own clothes: %s", how)
+        # One AI retouch over the assembled picture so hair, body and backdrop become one photo (her face
+        # and the inside of her clothes are protected, and both are put back exactly afterwards).
+        if BLEND_PASS and M is not None:
+            out = await blend_pass(out, sent, lm, seg_src, wig_rgb, p, outfit)
     before = crop
     if added is not None and added.any():
         a_ = cv2.GaussianBlur(added.astype(np.float32), (0, 0), 3)[..., None]
