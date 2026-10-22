@@ -1016,18 +1016,22 @@ def beautify(rgb: np.ndarray, lm: np.ndarray, strength: float = 0.75, style: str
             axes = (int(np.linalg.norm(lm[corner_a] - lm[corner_b]) * 0.62), px(0.05))
             cv2.ellipse(under, tuple(np.round(c).astype(int)), axes, 0, 0, 360, 1.0, -1)
         under = cv2.GaussianBlur(under, (0, 0), px(0.03)) * (1 - feats)
-        L += face * 4.0 * k + under * 6.0 * k
+        # natural = smoothing only: no lift, so the eyes and face keep their own light
+        if (style or "").lower() != "natural":
+            L += face * 4.0 * k + under * 6.0 * k
 
     lab = np.stack([L, A, B], -1)
     out = _rgb(lab)
 
     # 5. Crisper eyes, brows and lips; a touch of lip colour.
-    sharp = out + (out - cv2.GaussianBlur(out, (0, 0), max(1.0, 0.006 * fw))) * 0.6 * k
+    # (not in natural: sharpening makes eyes look glassy, worst on small faces that were enlarged)
+    feat_k = 0.0 if (style or "").lower() == "natural" else k
+    sharp = out + (out - cv2.GaussianBlur(out, (0, 0), max(1.0, 0.006 * fw))) * 0.6 * feat_k
     fm = (feats * face)[..., None]
     out = out * (1 - fm) + sharp * fm
     lips = _poly_mask(rgb.shape, lm[LIPS], blur=px(0.008))
     lab = _lab(out)
-    lab[..., 1:] = 128 + (lab[..., 1:] - 128) * (1 + lips * 0.12 * k)[..., None]
+    lab[..., 1:] = 128 + (lab[..., 1:] - 128) * (1 + lips * 0.12 * feat_k)[..., None]
     out = _rgb(lab)
     if (style or os.getenv("BEAUTY_STYLE", "glam")).lower() == "glam":
         out = glam(out, lm, k, face, skin, feats, px, skin_extra)
