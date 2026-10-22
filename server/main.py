@@ -205,7 +205,7 @@ def build_prompt_pure(p: dict, retry_note: str = "", outfit: str = "") -> str:
         "different style. Fit it like a professionally installed wig: flush and snug on the scalp, the top close to the "
         "head, a soft natural hairline blending into her forehead and temples, no visible lace, cap or edges. The hair "
         "covers both ears completely and falls naturally over the shoulders and down the front and back, as long as the "
-        "wig is, with real volume, shadows and light, casting soft shadows on the neck and shoulders where it touches "
+        "wig is, full and dense with no thin or see-through patches, with real volume, shadows and light, casting soft shadows on the neck and shoulders where it touches "
         "them. Completely hide her own hair and anything on her head (scarf, cap, hood, headphones, bonnet) under the wig.\n\n"
         "THE FACE: the face in image 1 is already professionally retouched. Keep it EXACTLY as it is: do not redraw, "
         "reshape, resize, smooth, sharpen, slim, enlarge the eyes or change it in any way. The same face shape, eyes, "
@@ -218,7 +218,7 @@ def build_prompt_pure(p: dict, retry_note: str = "", outfit: str = "") -> str:
         + (f"She is wearing: {outfit}. It must stay exactly that. " if outfit else "")
         + "The wig's hair may fall in front of the clothes.\n\n"
         "THE PHOTO: soft, even studio light that is the same on the face, hair, neck and clothes and keeps her real skin tone. A plain, "
-        "seamless, softly lit light grey-white studio backdrop, with nothing else in the background. Head-and-shoulders "
+        "seamless, softly lit light grey-white studio backdrop that fills the whole frame edge to edge, with nothing of her original room (walls, ceiling, lights, furniture) left anywhere. Head-and-shoulders "
         "framing as in image 1. If any part of image 1 is blurred or empty at the edges, continue the hair, shoulders "
         "and backdrop naturally there. Sharp, clean, high quality, photorealistic."
         + (f"\n\nIMPORTANT, previous attempt failed: {retry_note}" if retry_note else "")
@@ -262,10 +262,11 @@ def check_result(crop: np.ndarray, lm: np.ndarray, out: np.ndarray, out_lm, seg_
             dab = float(np.linalg.norm(la[cl][:, 1:].mean(0) - lb[cl][:, 1:].mean(0)))
             dL = abs(float(la[cl][:, 0].mean() - lb[cl][:, 0].mean()))
             # pattern: a plain garment must not come back printed (camouflage, florals), nor the reverse
-            dtex = abs(float(lb[cl][:, 0].std() - la[cl][:, 0].std())) + 0.5 * abs(
-                float(lb[cl][:, 1:].std(0).mean() - la[cl][:, 1:].std(0).mean()))
-            if dtex > 10:
-                score += (dtex - 10) * 0.5 + 6
+            # one-sided and with a wide margin, so light, shadows and stray strands never count
+            dtex = float(lb[cl][:, 0].std() - la[cl][:, 0].std()) + 0.5 * float(
+                lb[cl][:, 1:].std(0).mean() - la[cl][:, 1:].std(0).mean())
+            if dtex > 14:
+                score += (dtex - 14) * 0.5 + 6
                 why.append("her clothes were changed or a pattern was added; keep exactly the same garment, "
                            "colour and pattern as in image 1")
             if dab > 9 or dL > 30:
@@ -514,12 +515,6 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
             break
         note = why
     score, out, seg_out, out_lm, why = best
-    # Last resort, only if every attempt still changed her clothes: put her real clothes back where
-    # the new hair isn't covering them. Her clothes are never allowed to be made up.
-    if "clothes" in why and seg_src is not None and seg_out is not None:
-        M = align(lm, out_lm, strict=False) if out_lm is not None else None
-        out, frac = keep_clothes(crop, out, M, seg_src, seg_out)
-        log.info("clothes restored from her photo (%.0f%% of the picture)", frac * 100)
     # Her face stays her face: her own (smoothed) face goes back on the result, and the result's skin
     # (neck, ears, chest) is first brought to her exact skin colour so there is no edge where they meet.
     locked = False
