@@ -23,7 +23,7 @@ import catalog_store
 import db
 from status import STATUS
 from admin import router as admin_router
-from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
+from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -40,6 +40,8 @@ BLEND_MODE = os.getenv("BLEND_MODE", "pure").strip().lower()
 # result (same person, same clothes), regenerating if a check fails. Nothing is pasted back in.
 # 1 = the result keeps her exact skin tone, 0 = whatever the AI drew
 # on = her real face (smoothed only) is used in the result, never the AI redraw of it
+# on = a result whose clothes could not be kept is never shown (she is asked for a clearer photo)
+CLOTHES_STRICT = os.getenv("CLOTHES_STRICT", "on").lower() not in ("0", "off", "false", "no")
 KEEP_CLOTHES = os.getenv("KEEP_CLOTHES", "on").lower() not in ("0", "off", "false", "no")
 KEEP_FACE = os.getenv("KEEP_FACE", "on").lower() not in ("0", "off", "false", "no")
 SKIN_TONE = max(0.0, min(1.0, float(os.getenv("SKIN_TONE", "1"))))
@@ -277,6 +279,12 @@ def check_result(crop: np.ndarray, lm: np.ndarray, out: np.ndarray, out_lm, seg_
             if dab > 9 or dL > 30:
                 score += max(dab - 9, 0) + max(dL - 30, 0) * 0.5 + 5
                 why.append("her clothes changed colour; keep her clothing exactly as in image 1")
+        # the strict clothes guardrail: her garment must still be there, in the same shape and place
+        fit = garment_fit(crop, seg_src, out, seg_out, M)
+        if fit is not None and fit[2] < 0.5:
+            score += 20 + (0.5 - fit[2]) * 40
+            why.append("her clothes, pose or body were changed; this is an edit of image 1: keep her exact clothes, "
+                       "pose, arms and hands and change only the hair and the background")
         gap = skin_tone_gap(crop, seg_src, out, seg_out)
         if gap is not None:
             dL, dc = gap
@@ -535,6 +543,10 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
         M = align(lm, out_lm, strict=False) if out_lm is not None else None
         out, how = restore_clothes(crop, seg_src, out, seg_out, M)
         log.info("her own clothes: %s", how)
+        # Never show a made-up outfit: if her clothes couldn't be kept, ask for a clearer photo instead
+        if CLOTHES_STRICT and not (how.startswith("kept") or how.startswith("no clothes")):
+            raise HTTPException(422, "We couldn't keep your outfit exactly as it is in this photo. Please take a new "
+                                     "photo facing the camera, with your head and shoulders in view and your hands down.")
     before = crop
     if added is not None and added.any():
         a_ = cv2.GaussianBlur(added.astype(np.float32), (0, 0), 3)[..., None]
