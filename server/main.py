@@ -23,7 +23,7 @@ import catalog_store
 import db
 from status import STATUS
 from admin import router as admin_router
-from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
+from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, keep_body, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -262,7 +262,8 @@ def check_result(crop: np.ndarray, lm: np.ndarray, out: np.ndarray, out_lm, seg_
         out_s = cv2.warpAffine(out, Minv, (W, H), borderMode=cv2.BORDER_REPLICATE)
         hair_o = cv2.warpAffine(np.ascontiguousarray(seg_out[..., HAIR]), Minv, (W, H)) > 0.3
         cl &= ~cv2.dilate(hair_o.astype(np.uint8), np.ones((9, 9), np.uint8)).astype(bool)
-        if cl.sum() > 2000:
+        # (with KEEP_CLOTHES her real clothes go on the result anyway, so no retry is spent on them)
+        if cl.sum() > 2000 and not KEEP_CLOTHES:
             la = cv2.cvtColor(crop, cv2.COLOR_RGB2LAB).astype(np.float32)
             lb = cv2.cvtColor(out_s, cv2.COLOR_RGB2LAB).astype(np.float32)
             # colour of the garment (broad): allow the lighting to change a little, not the colour
@@ -281,12 +282,12 @@ def check_result(crop: np.ndarray, lm: np.ndarray, out: np.ndarray, out_lm, seg_
                 why.append("her clothes changed colour; keep her clothing exactly as in image 1")
         # the strict clothes guardrail: her garment must still be there, in the same shape and place
         fit = garment_fit(crop, seg_src, out, seg_out, M)
-        if fit is not None and fit[2] < 0.5:
+        if fit is not None and fit[2] < 0.5 and not KEEP_CLOTHES:
             score += 20 + (0.5 - fit[2]) * 40
             why.append("her clothes, pose or body were changed; this is an edit of image 1: keep her exact clothes, "
                        "pose, arms and hands and change only the hair and the background")
         gap = skin_tone_gap(crop, seg_src, out, seg_out)
-        if gap is not None:
+        if gap is not None and SKIN_TONE <= 0:  # otherwise her tone is put back afterwards anyway
             dL, dc = gap
             # lightness only: the colour of her photo is often off (office or bulb light), not her skin
             if abs(dL) > 7:
@@ -538,15 +539,21 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
     if KEEP_FACE:
         out, locked = face_lock(sent, lm, out, out_lm, bool(p.get("bangs")), enhance=0, relight=0.4)
         log.info("her own face kept: %s", locked)
-    # Her clothes stay her clothes, whatever the AI drew (hair falling over them stays the AI's)
+    # Her clothes stay her clothes, by construction: her real body and clothes from her photo, placed
+    # relative to her face exactly as in her photo, under the new hair; anything the AI invented
+    # outside her body becomes backdrop.
     if KEEP_CLOTHES and seg_src is not None and seg_out is not None:
-        M = align(lm, out_lm, strict=False) if out_lm is not None else None
-        out, how = restore_clothes(crop, seg_src, out, seg_out, M)
+        M = align(lm, out_lm) if out_lm is not None else None
+        if M is None and out_lm is not None:
+            M = align(lm, out_lm, strict=False)
+        if M is not None:
+            out, how = keep_body(sent, seg_src, out, seg_out, M)
+        else:
+            out, how = restore_clothes(crop, seg_src, out, seg_out, None)
+            if CLOTHES_STRICT and not (how.startswith("kept") or how.startswith("no clothes")):
+                raise HTTPException(422, "We couldn't keep your outfit exactly as it is in this photo. Please take a "
+                                         "new photo facing the camera, with your head and shoulders in view.")
         log.info("her own clothes: %s", how)
-        # Never show a made-up outfit: if her clothes couldn't be kept, ask for a clearer photo instead
-        if CLOTHES_STRICT and not (how.startswith("kept") or how.startswith("no clothes")):
-            raise HTTPException(422, "We couldn't keep your outfit exactly as it is in this photo. Please take a new "
-                                     "photo facing the camera, with your head and shoulders in view and your hands down.")
     before = crop
     if added is not None and added.any():
         a_ = cv2.GaussianBlur(added.astype(np.float32), (0, 0), 3)[..., None]
