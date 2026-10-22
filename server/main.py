@@ -5,6 +5,7 @@ import asyncio
 import base64
 import io
 import logging
+import re
 import os
 import time
 from collections import OrderedDict, defaultdict, deque
@@ -622,6 +623,11 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
             # drew elsewhere (moved hands, extra arms) becomes backdrop; the blend pass smooths the result.
             out, how = keep_body(sent, seg_src, out, seg_out, M)
             how += f", match {fit[2]:.2f}" if fit is not None else ""
+            # Also blend when a visible amount of what the AI drew had to be taken out (that leaves hard
+            # cut-out edges which only the blend pass can make natural)
+            cut = re.search(r"(\d+) invented px", how)
+            if cut and int(cut.group(1)) > 0.01 * OUT_W * OUT_H:
+                needs_blend = True
         else:
             out, how = restore_clothes(crop, seg_src, out, seg_out, None)
             if CLOTHES_STRICT and not (how.startswith("kept") or how.startswith("no clothes")):
