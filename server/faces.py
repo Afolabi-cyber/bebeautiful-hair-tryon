@@ -1253,3 +1253,59 @@ def keep_skin_tone(ref: np.ndarray, seg_ref: np.ndarray, out: np.ndarray, seg_ou
     lab[..., 1] += dab[0] * skin
     lab[..., 2] += dab[1] * skin
     return _to_u8(_rgb(lab))
+
+
+def restore_clothes(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np.ndarray,
+                    M: np.ndarray | None) -> tuple[np.ndarray, str]:
+    """Her clothes, exactly as photographed, on the result.
+
+    1. The result's whole garment is recoloured to her garment's colours (so every bit the AI drew,
+       including between braids and at the edges, is already the right colour: no odd rims).
+    2. Her real garment pixels then go on top wherever the result has clothes and no hair.
+    Only the CLOTHES class is used (never background or accessories), hair always stays the AI's,
+    and nothing happens if her garment can't be lined up with the result's.
+    Returns (image, note for the log)."""
+    H, W = out.shape[:2]
+    if M is None:
+        M = np.float32([[W / src.shape[1], 0, 0], [0, H / src.shape[0], 0]])
+    warp = lambda x, f=cv2.INTER_LINEAR: cv2.warpAffine(x, M, (W, H), flags=f, borderMode=cv2.BORDER_REPLICATE)
+    src_w = warp(src)
+    c_src = warp(np.ascontiguousarray(seg_src[..., CLOTHES]), cv2.INTER_LINEAR)
+    c_out = seg_out[..., CLOTHES]
+    if (c_src > 0.5).sum() < 1500 or (c_out > 0.5).sum() < 1500:
+        return out, "no clothes to keep"
+    # The body can sit a little differently from the face: line the garments up with each other
+    (dx, dy), _ = cv2.phaseCorrelate(c_src.astype(np.float64), c_out.astype(np.float64))
+    if abs(dx) < 0.08 * W and abs(dy) < 0.08 * H:
+        T = np.float32([[1, 0, dx], [0, 1, dy]])
+        src_w = cv2.warpAffine(src_w, T, (W, H), borderMode=cv2.BORDER_REPLICATE)
+        c_src = cv2.warpAffine(c_src, T, (W, H))
+    a, b = c_src > 0.5, c_out > 0.5
+    iou = float((a & b).sum()) / float((a | b).sum() + 1)
+    if iou < 0.3:
+        return out, f"garment shape too different to line up (overlap {iou:.2f})"
+    colour_only = iou < 0.5  # lined up too loosely to place her pixels, but her colours still apply
+
+    hair = np.clip((seg_out[..., HAIR] - 0.35) / 0.3, 0, 1).astype(np.float32)
+    # 1. recolour the AI's garment to hers (mean and spread per Lab channel)
+    lo, ls = _lab(out), _lab(src_w)
+    ref = ls[a & ~(hair > 0.5)] if (a & ~(hair > 0.5)).sum() > 800 else ls[a]
+    cur = lo[b & ~(hair > 0.5)] if (b & ~(hair > 0.5)).sum() > 800 else lo[b]
+    mr, sr, mo, so = ref.mean(0), ref.std(0) + 1e-3, cur.mean(0), cur.std(0) + 1e-3
+    k = np.clip(sr / so, 0.6, 1.6)
+    moved = (lo - mo) * k + mr
+    w1 = cv2.GaussianBlur(np.clip((c_out - 0.3) / 0.4, 0, 1).astype(np.float32), (0, 0), 1.5)
+    w1 = (w1 * (1 - hair))[..., None]
+    lo = lo * (1 - w1) + moved * w1
+    res = _rgb(lo)
+    if colour_only:
+        return _to_u8(res), f"recoloured only (overlap {iou:.2f})"
+    # 2. her real garment where both pictures have it and no hair lies on it
+    grow = cv2.dilate(b.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+    keep = (a & grow).astype(np.float32)
+    keep = cv2.erode(keep, np.ones((3, 3), np.uint8))
+    hair_block = cv2.dilate((seg_out[..., HAIR] > 0.35).astype(np.uint8),
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))).astype(np.float32)
+    keep = cv2.GaussianBlur(keep * (1 - hair_block), (0, 0), 1.2)[..., None]
+    res = src_w.astype(np.float32) * keep + res * (1 - keep)
+    return _to_u8(res), f"kept (overlap {iou:.2f}, {float(keep.mean()) * 100:.0f}% of picture)"
