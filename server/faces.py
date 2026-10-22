@@ -1333,7 +1333,7 @@ def restore_clothes(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_o
 
 
 def keep_body(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np.ndarray,
-              M: np.ndarray) -> tuple[np.ndarray, str]:
+              M: np.ndarray, inset: int = 1) -> tuple[np.ndarray, str]:
     """Her own body and clothes, always, by construction (whatever the AI drew there).
 
     The AI's picture supplies only the new hair, the head and the backdrop. Her real clothes, arms,
@@ -1366,11 +1366,12 @@ def keep_body(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np
     res = _rgb(res)
 
     # 2. Body the AI invented where her photo had only background: plain backdrop instead.
+    #    (skipped on the blended pass: there the AI already finished those edges)
     ai_body = np.clip(seg_out[..., CLOTHES] + seg_out[..., BODY_SKIN] + seg_out[..., OTHERS], 0, 1)
     was_bg = (body < 0.3) & (old_hair < 0.3) & (seg_w[..., FACE_SKIN] < 0.3)
     invented = ((ai_body > 0.5) & was_bg & (new_hair < 0.35)).astype(np.uint8)
     invented = cv2.morphologyEx(invented, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    if invented.any():
+    if invented.any() and inset <= 1:
         bgm = cv2.erode((seg_out[..., BG] > 0.7).astype(np.uint8), np.ones((7, 7), np.uint8)).astype(np.float32)
         sig = max(8.0, 0.08 * W)
         num = cv2.GaussianBlur(out.astype(np.float32) * bgm[..., None], (0, 0), sig)
@@ -1382,8 +1383,11 @@ def keep_body(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np
         res = res * (1 - a) + plate * a
 
     # 3. Her real body on top, under the new hair. Edge pulled in 1 px so none of her old room shows.
-    keep = cv2.erode((body > 0.5).astype(np.uint8), np.ones((3, 3), np.uint8)).astype(np.float32)
-    block = cv2.dilate((new_hair > 0.35).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-    keep = cv2.GaussianBlur(keep * (1 - block), (0, 0), 1.0)[..., None]
+    # (inset > 1: only the inside of her clothes/body, the edges stay as the AI blended them)
+    e = 2 * inset + 1
+    keep = cv2.erode((body > 0.5).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (e, e))).astype(np.float32)
+    g = 2 * max(2, inset // 2) + 1
+    block = cv2.dilate((new_hair > 0.35).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (g, g)))
+    keep = cv2.GaussianBlur(keep * (1 - block), (0, 0), max(1.0, inset / 2.5))[..., None]
     res = src_w * keep + res * (1 - keep)
     return _to_u8(res), f"kept ({float(keep.mean()) * 100:.0f}% of picture, {int(invented.sum())} invented px removed)"
