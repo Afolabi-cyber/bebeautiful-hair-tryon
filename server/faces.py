@@ -1387,7 +1387,9 @@ def keep_body(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np
     invented = cv2.morphologyEx(invented, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     # follow = the AI re-posed her: keep its pose (her arms where it put them), so nothing of her old
     # pose is pasted where the result has no body (no floating sleeves or hands)
-    if invented.any() and not follow:
+    # Only on the first assembly. After the AI blend pass its edges, shadows and the surface under her
+    # arms are what make the picture whole, so they stay (stray pieces are caught by tidy_body).
+    if invented.any() and not follow and inset <= 1:
         bgm = cv2.erode((seg_out[..., BG] > 0.7).astype(np.uint8), np.ones((7, 7), np.uint8)).astype(np.float32)
         sig = max(8.0, 0.08 * W)
         num = cv2.GaussianBlur(out.astype(np.float32) * bgm[..., None], (0, 0), sig)
