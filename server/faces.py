@@ -1259,6 +1259,33 @@ def keep_skin_tone(ref: np.ndarray, seg_ref: np.ndarray, out: np.ndarray, seg_ou
     return _to_u8(_rgb(lab))
 
 
+def garment_fit(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np.ndarray, M: np.ndarray | None):
+    """Line her garment up with the result's. Returns (her photo moved onto the result, her garment mask
+    there, overlap 0..1 of the two garments) or None when either picture shows no clothes."""
+    H, W = out.shape[:2]
+    if M is None:
+        M = np.float32([[W / src.shape[1], 0, 0], [0, H / src.shape[0], 0]])
+    warp = lambda x, f=cv2.INTER_LINEAR: cv2.warpAffine(x, M, (W, H), flags=f, borderMode=cv2.BORDER_REPLICATE)
+    src_w = warp(src)
+    c_src = warp(np.ascontiguousarray(seg_src[..., CLOTHES]), cv2.INTER_LINEAR)
+    c_out = seg_out[..., CLOTHES]
+    if (c_src > 0.5).sum() < 1500:
+        return None  # she shows no clothes to keep
+    if (c_out > 0.5).sum() < 1500:
+        return src_w, c_src, 0.0  # her clothes are gone from the result
+    # The body can sit a little differently from the face: line the garments up with each other
+    (dx, dy), _ = cv2.phaseCorrelate(c_src.astype(np.float64), c_out.astype(np.float64))
+    if abs(dx) < 0.08 * W and abs(dy) < 0.08 * H:
+        T = np.float32([[1, 0, dx], [0, 1, dy]])
+        src_w = cv2.warpAffine(src_w, T, (W, H), borderMode=cv2.BORDER_REPLICATE)
+        c_src = cv2.warpAffine(c_src, T, (W, H))
+    # compare only where the new hair doesn't cover (long hair hides part of any garment)
+    free = seg_out[..., HAIR] < 0.35
+    a, b = (c_src > 0.5) & free, (c_out > 0.5) & free
+    iou = float((a & b).sum()) / float((a | b).sum() + 1)
+    return src_w, c_src, iou
+
+
 def restore_clothes(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np.ndarray,
                     M: np.ndarray | None) -> tuple[np.ndarray, str]:
     """Her clothes, exactly as photographed, on the result.
@@ -1270,22 +1297,12 @@ def restore_clothes(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_o
     and nothing happens if her garment can't be lined up with the result's.
     Returns (image, note for the log)."""
     H, W = out.shape[:2]
-    if M is None:
-        M = np.float32([[W / src.shape[1], 0, 0], [0, H / src.shape[0], 0]])
-    warp = lambda x, f=cv2.INTER_LINEAR: cv2.warpAffine(x, M, (W, H), flags=f, borderMode=cv2.BORDER_REPLICATE)
-    src_w = warp(src)
-    c_src = warp(np.ascontiguousarray(seg_src[..., CLOTHES]), cv2.INTER_LINEAR)
-    c_out = seg_out[..., CLOTHES]
-    if (c_src > 0.5).sum() < 1500 or (c_out > 0.5).sum() < 1500:
+    fit = garment_fit(src, seg_src, out, seg_out, M)
+    if fit is None:
         return out, "no clothes to keep"
-    # The body can sit a little differently from the face: line the garments up with each other
-    (dx, dy), _ = cv2.phaseCorrelate(c_src.astype(np.float64), c_out.astype(np.float64))
-    if abs(dx) < 0.08 * W and abs(dy) < 0.08 * H:
-        T = np.float32([[1, 0, dx], [0, 1, dy]])
-        src_w = cv2.warpAffine(src_w, T, (W, H), borderMode=cv2.BORDER_REPLICATE)
-        c_src = cv2.warpAffine(c_src, T, (W, H))
+    src_w, c_src, iou = fit
+    c_out = seg_out[..., CLOTHES]
     a, b = c_src > 0.5, c_out > 0.5
-    iou = float((a & b).sum()) / float((a | b).sum() + 1)
     if iou < 0.3:
         return out, f"garment shape too different to line up (overlap {iou:.2f})"
     colour_only = iou < 0.5  # lined up too loosely to place her pixels, but her colours still apply
