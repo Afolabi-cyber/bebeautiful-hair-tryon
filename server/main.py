@@ -23,7 +23,7 @@ import catalog_store
 import db
 from status import STATUS
 from admin import router as admin_router
-from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, keep_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
+from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -40,6 +40,7 @@ BLEND_MODE = os.getenv("BLEND_MODE", "pure").strip().lower()
 # result (same person, same clothes), regenerating if a check fails. Nothing is pasted back in.
 # 1 = the result keeps her exact skin tone, 0 = whatever the AI drew
 # on = her real face (smoothed only) is used in the result, never the AI redraw of it
+KEEP_CLOTHES = os.getenv("KEEP_CLOTHES", "on").lower() not in ("0", "off", "false", "no")
 KEEP_FACE = os.getenv("KEEP_FACE", "on").lower() not in ("0", "off", "false", "no")
 SKIN_TONE = max(0.0, min(1.0, float(os.getenv("SKIN_TONE", "1"))))
 TRYON_ATTEMPTS = max(1, min(3, int(os.getenv("TRYON_ATTEMPTS", "3"))))
@@ -526,6 +527,11 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
     if KEEP_FACE:
         out, locked = face_lock(sent, lm, out, out_lm, bool(p.get("bangs")), enhance=0, relight=0.4)
         log.info("her own face kept: %s", locked)
+    # Her clothes stay her clothes, whatever the AI drew (hair falling over them stays the AI's)
+    if KEEP_CLOTHES and seg_src is not None and seg_out is not None:
+        M = align(lm, out_lm, strict=False) if out_lm is not None else None
+        out, how = restore_clothes(crop, seg_src, out, seg_out, M)
+        log.info("her own clothes: %s", how)
     before = crop
     if added is not None and added.any():
         a_ = cv2.GaussianBlur(added.astype(np.float32), (0, 0), 3)[..., None]
