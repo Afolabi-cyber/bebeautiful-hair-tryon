@@ -875,9 +875,13 @@ def make_room(rgb: np.ndarray, lm: np.ndarray, aspect: float = 2 / 3):
     cx = float(lm[FACE_OVAL][:, 0].mean())
     top = float(lm[FOREHEAD][1]) - 1.2 * g.height
     pt = int(np.ceil(max(0.0, -top)))
-    pb = int(np.ceil(max(0.0, top + box_h - H)))
-    pl = int(np.ceil(max(0.0, box_w / 2 - cx)))
-    pr = int(np.ceil(max(0.0, cx + box_w / 2 - W)))
+    # Never extend below or far to the sides: that is where the AI would have to invent her shoulders,
+    # arms and the rest of her clothes. Only room above the head and a little at the sides for the
+    # hair; the crop then frames what she really photographed.
+    pb = 0
+    need_w = min(box_w, 2.8 * g.width)
+    pl = int(np.ceil(max(0.0, need_w / 2 - cx)))
+    pr = int(np.ceil(max(0.0, cx + need_w / 2 - W)))
     valid = np.ones((H, W), np.uint8)
     if max(pt, pb, pl, pr) == 0:
         return rgb, lm, valid
@@ -1129,7 +1133,7 @@ def _masked_blur(img: np.ndarray, weight: np.ndarray, sigma: float) -> np.ndarra
 
 
 def face_lock(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.ndarray | None,
-              bangs: bool = False, enhance: float = 0.4) -> tuple[np.ndarray, bool]:
+              bangs: bool = False, enhance: float = 0.4, relight: float = 1.0) -> tuple[np.ndarray, bool]:
     """Blend the user's original face back onto the generated image. Returns (image, locked)."""
     if out_lm is None:
         return out, False
@@ -1180,8 +1184,8 @@ def face_lock(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.n
     sig = max(2.0, 0.06 * fw)
     low_s, low_o = _masked_blur(lab_s, skin, sig), _masked_blur(lab_o, skin, sig)
     delta = low_o - low_s
-    delta[..., 0] = np.clip(delta[..., 0], -18, 18)    # lightness
-    delta[..., 1:] = np.clip(delta[..., 1:], -14, 14)  # colour cast (camera white balance)
+    delta[..., 0] = np.clip(delta[..., 0], -18 * relight, 18 * relight)    # lightness
+    delta[..., 1:] = np.clip(delta[..., 1:], -14 * relight, 14 * relight)  # colour cast (camera white balance)
     face = lab_s + delta
 
     warped = cv2.cvtColor(np.clip(face, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
@@ -1194,3 +1198,58 @@ def face_lock(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.n
 
     blended = warped.astype(np.float32) * alpha + out.astype(np.float32) * (1 - alpha)
     return np.clip(blended, 0, 255).astype(np.uint8), True
+
+
+def _skin_stats(rgb: np.ndarray, seg: np.ndarray):
+    """Mean and spread of her face skin in Lab (lips, eyes and brows are not FACE_SKIN in the model)."""
+    m = seg[..., FACE_SKIN] > 0.6
+    if m.sum() < 500:
+        return None
+    lab = _lab(rgb)[m]
+    return lab.mean(0), lab.std(0) + 1e-3
+
+
+def skin_tone_gap(ref: np.ndarray, seg_ref: np.ndarray, out: np.ndarray, seg_out: np.ndarray):
+    """How far the result's face skin moved from hers: (lightness change, colour change), Lab units.
+    Positive lightness = the result is lighter."""
+    a, b = _skin_stats(ref, seg_ref), _skin_stats(out, seg_out)
+    if a is None or b is None:
+        return None
+    d = b[0] - a[0]
+    return float(d[0] * 100 / 255), float(np.hypot(d[1], d[2]))
+
+
+def keep_skin_tone(ref: np.ndarray, seg_ref: np.ndarray, out: np.ndarray, seg_out: np.ndarray,
+                   strength: float = 1.0, exact: bool = False) -> np.ndarray:
+    """Put her own skin tone back on the result's skin (face, neck, arms) when the AI lightened, darkened
+    or tinted it. One smooth colour shift through a soft skin mask: nothing is pasted, nothing is moved,
+    the AI's light and the texture it kept stay, so there is no edge or line anywhere."""
+    a, b = _skin_stats(ref, seg_ref), _skin_stats(out, seg_out)
+    if a is None or b is None or strength <= 0:
+        return out
+    (mr, sr), (mo, so) = a, b
+    H, W = out.shape[:2]
+    skin = np.clip((seg_out[..., FACE_SKIN] + seg_out[..., BODY_SKIN] - 0.3) / 0.4, 0, 1).astype(np.float32)
+    # keep the wig and glasses untouched where they overlap skin, then feather widely
+    skin *= 1 - np.clip((seg_out[..., HAIR] + seg_out[..., OTHERS] - 0.3) / 0.4, 0, 1)
+    skin = cv2.GaussianBlur(skin, (0, 0), max(3.0, 0.012 * W)) * strength
+    lab = _lab(out)
+    # Her photo's own colour cast (blue office light, yellow bulbs) is not her skin: measure it on the
+    # neutral greys/whites of each picture (ceiling, walls, backdrop) and leave it out of the target.
+    def cast(img, seg):
+        l = _lab(img)
+        c = np.hypot(l[..., 1] - 128, l[..., 2] - 128)
+        n = (c < 14) & (l[..., 0] > 90) & (seg[..., FACE_SKIN] + seg[..., BODY_SKIN] < 0.2)
+        return (l[n][:, 1:].mean(0) - 128) if n.sum() > 800 else np.zeros(2, np.float32)
+    # exact: her skin colour as photographed (her real face goes back on top, so they must match)
+    want_ab = mr[1:] if exact else mr[1:] - (cast(ref, seg_ref) - cast(out, seg_out))
+    # lightness: her mean, a contrast close to hers (capped so shading stays natural)
+    ratio = float(np.clip(sr[0] / so[0], 0.85, 1.15))
+    L = (lab[..., 0] - mo[0]) * ratio + mr[0]
+    dL = np.clip(L - lab[..., 0], -40, 40)  # at most ~16 L* units either way
+    # colour: half way to hers, so a photo taken in odd light never turns the result ashy or orange
+    dab = np.clip(want_ab - mo[1:], -14, 14) if exact else np.clip(0.5 * (want_ab - mo[1:]), -6, 6)
+    lab[..., 0] += dL * skin
+    lab[..., 1] += dab[0] * skin
+    lab[..., 2] += dab[1] * skin
+    return _to_u8(_rgb(lab))

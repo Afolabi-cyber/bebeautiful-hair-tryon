@@ -1,7 +1,7 @@
-import { Camera, Download, Share2, ShoppingBag, ShieldCheck, RotateCcw } from "lucide-react";
+import { Camera, Download, Share2, ShoppingBag, ShieldCheck, RotateCcw, Sparkles } from "lucide-react";
 import { Button, CompareSlider } from "../ui/ui.jsx";
 
-export default function Result({ looks, active, setActive, product, onNewPhoto, onStartAgain }) {
+export default function Result({ looks, active, setActive, product, onNewPhoto, onStartAgain, onPickStyle, onShop }) {
   const look = looks[active];
   const p = product(look.wigId) || { name: "Your look" };
   const fileName = `my-${look.wigId}.jpg`;
@@ -73,12 +73,17 @@ export default function Result({ looks, active, setActive, product, onNewPhoto, 
 
       <div className="space-y-2.5 px-4 pt-2 safe-bottom">
         {p.buyUrl && (
-          <Button onClick={() => window.open(p.buyUrl, "_blank", "noopener")} className="w-full h-14 text-base">
+          <Button onClick={() => (onShop ? onShop(p.buyUrl) : window.open(p.buyUrl, "_blank", "noopener"))} className="w-full h-14 text-base">
             <ShoppingBag className="size-5" /> Shop this look
           </Button>
         )}
+        {onPickStyle && (
+          <Button variant={p.buyUrl ? "dark" : "primary"} onClick={onPickStyle} className="w-full h-12">
+            <Sparkles className="size-4" /> Try another style
+          </Button>
+        )}
         <div className="grid grid-cols-2 gap-2.5">
-          <Button variant={p.buyUrl ? "dark" : "primary"} onClick={onNewPhoto} className="h-12">
+          <Button variant="soft" onClick={onNewPhoto} className="h-12">
             <Camera className="size-4" /> New photo
           </Button>
           <Button variant="soft" onClick={onStartAgain} className="h-12">

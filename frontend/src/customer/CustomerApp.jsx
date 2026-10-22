@@ -6,11 +6,16 @@ import Camera from "./Camera.jsx";
 import Review from "./Review.jsx";
 import Generating from "./Generating.jsx";
 import Result from "./Result.jsx";
+import WigPicker from "./WigPicker.jsx";
 
-// Customers arrive from a product page on the website (?wig=...), so the style is already chosen.
-// One straight path: details -> photo -> your look.
-const STEP = { welcome: 0, camera: 1, review: 1, generating: 2, failed: 2, result: 2 };
-const BACK = { camera: "welcome", review: "camera" };
+// From a product page (?wig=...) the style is already chosen: details -> photo -> your look.
+// Opened without one (or "Try another style" on the result): details -> photo -> pick a style -> your look.
+const STEP = { welcome: 0, camera: 1, review: 1, pick: 2, generating: 2, failed: 2, result: 2 };
+const BACK = { camera: "welcome", review: "camera", pick: "camera" };
+
+// Shown inside the website's product page (embed.js opens the app in a pop-up frame with ?embed=1).
+const EMBED = (() => { try { return new URLSearchParams(window.location.search).get("embed") === "1"; } catch { return false; } })();
+const toSite = (msg) => { try { window.parent.postMessage({ source: "bbh-tryon", ...msg }, "*"); } catch { /* not framed */ } };
 
 // Only name and phone are remembered on this phone (to prefill the form next time).
 // Photos and results are never restored: every visit starts fresh.
@@ -94,7 +99,7 @@ export default function CustomerApp() {
       setWigId(preset);
       tryOn(preset, res.sessionId, []);
     } else {
-      setScreen("welcome"); // no style chosen: the welcome screen explains how to start from the shop
+      setScreen("pick"); // no style chosen yet: she picks one here
     }
   }
 
@@ -119,7 +124,7 @@ export default function CustomerApp() {
   }
 
   const views = {
-    welcome: loaded && !preset ? <NoStyle brand={brand} unknown={!!LINKED} /> : (
+    welcome: loaded && products.length === 0 ? <NoStyle brand={brand} unknown={!!LINKED} /> : (
       <Welcome
         brand={brand}
         products={products}
@@ -138,6 +143,21 @@ export default function CustomerApp() {
     review: draft && (
       <Review url={draft.url} name={customer?.name} onRetake={() => setScreen("camera")} onConfirm={confirmPhoto} />
     ),
+    pick: (
+      <WigPicker
+        brand={brand}
+        customer={customer}
+        selfie={selfie}
+        products={products}
+        selected={wigId}
+        tried={new Set(looks.map((l) => l.wigId))}
+        onSelect={setWigId}
+        onTry={() => tryOn(wigId)}
+        onRetake={() => { setError(""); setScreen("camera"); }}
+        onShowLooks={looks.length ? () => setScreen("result") : null}
+        error={error}
+      />
+    ),
     generating: <Generating selfie={selfie} wig={product(wigId)} />,
     failed: (
       <Failed
@@ -154,6 +174,12 @@ export default function CustomerApp() {
         product={product}
         onNewPhoto={() => { setError(""); setScreen("camera"); }}
         onStartAgain={startAgain}
+        onPickStyle={products.length > 1 ? () => { setError(""); setScreen("pick"); } : null}
+        onShop={(url) => {
+          // In the website pop-up: on her own product page just close; another style opens its page
+          if (EMBED) toSite(looks[active]?.wigId === preset ? { type: "close" } : { type: "open", url });
+          else window.open(url, "_blank", "noopener");
+        }}
       />
     ),
   };

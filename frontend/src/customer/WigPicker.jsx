@@ -24,7 +24,7 @@ export default function WigPicker({
             </span>
           </button>
           <div className="min-w-0 flex-1">
-            <p className="text-xs font-semibold uppercase tracking-wider text-brand">Step 3 of 4</p>
+            <p className="text-xs font-semibold uppercase tracking-wider text-brand">Choose your style</p>
             <h1 className="font-display text-[26px] leading-tight">{first ? `Pick a style, ${first}` : "Pick a style"}</h1>
           </div>
           <button onClick={onRetake} className="shrink-0 rounded-full bg-white px-3 py-2 text-xs font-semibold ring-1 ring-espresso/10 active:scale-95 transition">

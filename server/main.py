@@ -23,7 +23,7 @@ import catalog_store
 import db
 from status import STATUS
 from admin import router as admin_router
-from faces import HAIR, FaceTool, backdrop, clothes_keep, compose_ai, make_room, Segmenter, hair_zone, head_crop, keep_mask, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
+from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, keep_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -35,7 +35,14 @@ RESULT_BACKGROUND = os.getenv("RESULT_BACKGROUND", "studio").lower()
 # "ai" (default): the AI renders the whole head (face, hair, light and shadows together, lightly
 # beautified); the face is then locked back to the customer's exact shape and features and her clothes
 # always come from her photo. "photo": her original face and photo with only the AI hair laid on top.
-BLEND_MODE = os.getenv("BLEND_MODE", "ai").strip().lower()
+BLEND_MODE = os.getenv("BLEND_MODE", "pure").strip().lower()
+# "pure" (default): the AI makes the final picture; the server only prepares the photo and checks the
+# result (same person, same clothes), regenerating if a check fails. Nothing is pasted back in.
+# 1 = the result keeps her exact skin tone, 0 = whatever the AI drew
+# on = her real face (smoothed only) is used in the result, never the AI redraw of it
+KEEP_FACE = os.getenv("KEEP_FACE", "on").lower() not in ("0", "off", "false", "no")
+SKIN_TONE = max(0.0, min(1.0, float(os.getenv("SKIN_TONE", "1"))))
+TRYON_ATTEMPTS = max(1, min(3, int(os.getenv("TRYON_ATTEMPTS", "3"))))
 FACE_ENHANCE = min(1.0, max(0.0, float(os.getenv("FACE_ENHANCE", "0.75"))))  # retouch strength: 0 = off, 0.75 = default, 1 = strongest
 OUT_W, OUT_H = 1024, 1536
 MAX_UPLOAD = 15 * 1024 * 1024
@@ -186,6 +193,98 @@ def build_prompt_ai(p: dict) -> str:
     )
 
 
+def build_prompt_pure(p: dict, retry_note: str = "", outfit: str = "") -> str:
+    desc = p.get("description") or p["name"]
+    return (
+        "Image 1 is a photo of a customer. Image 2 is a product photo of a wig (shown on its own, face area empty).\n"
+        f"Wig: {desc}.\n\n"
+        "Create ONE finished, photorealistic portrait of the customer from image 1 wearing this exact wig, as if "
+        "photographed in a professional studio. It must look like a real photograph, never like a collage or an edit.\n\n"
+        "THE WIG: reproduce image 2 faithfully: the same braid size and pattern, parting, curl type and where the curls "
+        "start, the same colours and ombre in the same places, the same length, density and fullness. Do not invent a "
+        "different style. Fit it like a professionally installed wig: flush and snug on the scalp, the top close to the "
+        "head, a soft natural hairline blending into her forehead and temples, no visible lace, cap or edges. The hair "
+        "covers both ears completely and falls naturally over the shoulders and down the front and back, as long as the "
+        "wig is, full and dense with no thin or see-through patches, with real volume, shadows and light, casting soft shadows on the neck and shoulders where it touches "
+        "them. Completely hide her own hair and anything on her head (scarf, cap, hood, headphones, bonnet) under the wig.\n\n"
+        "THE FACE: the face in image 1 is already professionally retouched. Keep it EXACTLY as it is: do not redraw, "
+        "reshape, resize, smooth, sharpen, slim, enlarge the eyes or change it in any way. The same face shape, eyes, "
+        "eyebrows, nose, lips, jaw, chin, expression, skin texture and exactly the same skin tone and complexion. Do not lighten, brighten, whiten, darken or tint her skin, and do not airbrush it: the natural skin texture stays. Keep the head exactly "
+        "where it is in image 1, at the same size and angle. Only the hairline at the top of the forehead and the hair "
+        "around the face are new. Keep glasses only if she is wearing them; do not add glasses, earrings, jewellery or "
+        "anything else she is not wearing.\n\n"
+        "THE CLOTHES: keep her clothing exactly as in image 1: the same garment, colour, pattern, print, neckline, collar "
+        "and fit, and keep any necklace. Never invent, replace or restyle her clothes, and never add a pattern or print. "
+        + (f"She is wearing: {outfit}. It must stay exactly that. " if outfit else "")
+        + "The wig's hair may fall in front of the clothes.\n\n"
+        "THE PHOTO: soft, even studio light that is the same on the face, hair, neck and clothes and keeps her real skin tone. A plain, "
+        "seamless, softly lit light grey-white studio backdrop that fills the whole frame edge to edge, with nothing of her original room (walls, ceiling, lights, furniture) left anywhere. Head-and-shoulders "
+        "framing as in image 1. If any part of image 1 is blurred or empty at the edges, fill it only with the hair and "
+        "the backdrop. Never extend or invent her body or clothes: no shoulders, arms, sleeves or chest that are not "
+        "visible in image 1, and the same neckline and collar. Sharp, clean, high quality, photorealistic."
+        + (f"\n\nIMPORTANT, previous attempt failed: {retry_note}" if retry_note else "")
+    )
+
+
+def check_result(crop: np.ndarray, lm: np.ndarray, out: np.ndarray, out_lm, seg_src, seg_out) -> tuple[float, str]:
+    """How good an AI result is (0 = perfect, higher = worse) and what went wrong, for a retry.
+    Checks only; the picture itself is never edited."""
+    if out_lm is None:
+        return 99.0, "the face was not clearly visible; show her face clearly, looking at the camera"
+    M = align(lm, out_lm, strict=False)
+    if M is None:
+        return 50.0, "the face moved, changed size or changed shape; keep her face exactly as in image 1"
+    g = geom(lm)
+    mapped = lm @ M[:, :2].T + M[:, 2]
+    # identity geometry: how far her eyes, brows, nose, lips and face outline moved relative to each other
+    ids = np.unique(np.concatenate([LEFT_EYE, RIGHT_EYE, LEFT_BROW, RIGHT_BROW, LIPS, NOSTRILS, FACE_OVAL]))
+    shape_err = float(np.percentile(np.linalg.norm(mapped[ids] - out_lm[ids], axis=1), 75)) / g.height
+    scale = float(np.sqrt(abs(np.linalg.det(M[:, :2]))))
+    shift = float(np.linalg.norm(M[:, 2] + lm.mean(0) @ M[:, :2].T - lm.mean(0))) / g.height
+    score, why = 0.0, []
+    # calibrated on real faces: same person (retouched, relit) <= 0.016, a different person >= 0.049
+    if shape_err > 0.022:
+        score += (shape_err - 0.022) * 400 + 3
+        why.append("her facial features changed; keep exactly the same eyes, nose, lips and face shape")
+    if abs(scale - 1) > 0.1 or shift > 0.25:
+        score += 10
+        why.append("the head moved or changed size; keep the same framing as image 1")
+    if seg_src is not None and seg_out is not None:
+        H, W = crop.shape[:2]
+        cl = (seg_src[..., CLOTHES] > 0.6) & ~cv2.dilate((old_hair(seg_src, lm) > 0.4).astype(np.uint8), np.ones((15, 15), np.uint8)).astype(bool)
+        Minv = cv2.invertAffineTransform(M)
+        out_s = cv2.warpAffine(out, Minv, (W, H), borderMode=cv2.BORDER_REPLICATE)
+        hair_o = cv2.warpAffine(np.ascontiguousarray(seg_out[..., HAIR]), Minv, (W, H)) > 0.3
+        cl &= ~cv2.dilate(hair_o.astype(np.uint8), np.ones((9, 9), np.uint8)).astype(bool)
+        if cl.sum() > 2000:
+            la = cv2.cvtColor(crop, cv2.COLOR_RGB2LAB).astype(np.float32)
+            lb = cv2.cvtColor(out_s, cv2.COLOR_RGB2LAB).astype(np.float32)
+            # colour of the garment (broad): allow the lighting to change a little, not the colour
+            dab = float(np.linalg.norm(la[cl][:, 1:].mean(0) - lb[cl][:, 1:].mean(0)))
+            dL = abs(float(la[cl][:, 0].mean() - lb[cl][:, 0].mean()))
+            # pattern: a plain garment must not come back printed (camouflage, florals), nor the reverse
+            # one-sided and with a wide margin, so light, shadows and stray strands never count
+            dtex = float(lb[cl][:, 0].std() - la[cl][:, 0].std()) + 0.5 * float(
+                lb[cl][:, 1:].std(0).mean() - la[cl][:, 1:].std(0).mean())
+            if dtex > 14:
+                score += (dtex - 14) * 0.5 + 6
+                why.append("her clothes were changed or a pattern was added; keep exactly the same garment, "
+                           "colour and pattern as in image 1")
+            if dab > 9 or dL > 30:
+                score += max(dab - 9, 0) + max(dL - 30, 0) * 0.5 + 5
+                why.append("her clothes changed colour; keep her clothing exactly as in image 1")
+        gap = skin_tone_gap(crop, seg_src, out, seg_out)
+        if gap is not None:
+            dL, dc = gap
+            # lightness only: the colour of her photo is often off (office or bulb light), not her skin
+            if abs(dL) > 7:
+                score += (abs(dL) - 7) * 0.5 + 2
+                how = "lighter" if dL > 0 else "darker"
+                why.append(f"her skin was made {how}; keep exactly her own skin tone from image 1, "
+                           "do not lighten, brighten or airbrush her skin")
+    return score, "; ".join(why)
+
+
 def to_rgb(data: bytes) -> np.ndarray:
     try:
         img = Image.open(io.BytesIO(data))
@@ -302,7 +401,7 @@ async def tryon(req: Request, session_id: str = Form(...), wig_id: str = Form(..
     if key in _cache:
         _cache.move_to_end(key)
         return _cache[key]
-    if segmenter() is None and not ALLOW_WITHOUT_HAIR_MODEL:
+    if BLEND_MODE != "pure" and segmenter() is None and not ALLOW_WITHOUT_HAIR_MODEL:
         raise HTTPException(503, "Virtual try-on is being set up. Please try again in a few minutes.")
     rate_limit("tryon", client_ip(req), TRYONS_PER_HOUR)
     if db.count_tryons(session_id, "ok") >= MAX_TRIES:
@@ -327,6 +426,113 @@ async def tryon(req: Request, session_id: str = Form(...), wig_id: str = Form(..
     if len(_cache) > 50:
         _cache.popitem(last=False)
     return out
+
+
+OUTFIT_MODEL = os.getenv("OUTFIT_MODEL", "gpt-4o-mini")
+
+
+async def describe_outfit(crop: np.ndarray) -> str:
+    """One line describing exactly what she is wearing, so the image prompt can name it (the image
+    model keeps clothes far better when told what they are). Empty if it can't be had quickly."""
+    try:
+        ok, jpg = cv2.imencode(".jpg", cv2.cvtColor(crop, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 85])
+        url = "data:image/jpeg;base64," + base64.b64encode(jpg.tobytes()).decode()
+        res = await asyncio.wait_for(openai_client().chat.completions.create(
+            model=OUTFIT_MODEL, max_tokens=60, temperature=0,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": "Describe only the clothing this person wears on the upper body, in one short "
+                 "line: garment type, exact colour, plain or the exact pattern, neckline or collar, buttons, and any "
+                 "necklace or glasses. No other words."},
+                {"type": "image_url", "image_url": {"url": url, "detail": "low"}}]}]), timeout=15)
+        text = (res.choices[0].message.content or "").strip().replace("\n", " ")
+        return text[:240]
+    except Exception as e:
+        log.warning("outfit description skipped: %s", e)
+        return ""
+
+
+async def ai_edit(crop: np.ndarray, wig_rgb: np.ndarray, prompt: str, keep: np.ndarray | None = None) -> np.ndarray:
+    kwargs = dict(
+        model=MODEL,
+        image=[("customer.png", encode(crop), "image/png"), ("wig.png", encode(wig_rgb), "image/png")],
+        prompt=prompt,
+        size=f"{OUT_W}x{OUT_H}",
+        quality=QUALITY,
+        output_format="png",
+        n=1,
+    )
+    if keep is not None:
+        kwargs["mask"] = ("mask.png", openai_mask_png(keep), "image/png")  # opaque = do not edit
+    if supports_fidelity(MODEL):
+        kwargs["input_fidelity"] = "high"
+    try:
+        res = await openai_client().images.edit(**kwargs)
+    except APIStatusError as e:
+        log.warning("OpenAI error %s: %s", e.status_code, e.message)
+        msg = ("The AI couldn't process this photo. Try a different one."
+               if e.status_code == 400 else "The AI is busy right now, please try again.")
+        raise HTTPException(502, msg)
+    out = to_rgb(base64.b64decode(res.data[0].b64_json))
+    if out.shape[:2] != (OUT_H, OUT_W):
+        out = cv2.resize(out, (OUT_W, OUT_H), interpolation=cv2.INTER_CUBIC)
+    return out
+
+
+async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dict, seg_src, added,
+                   src_scale: float = 1.0) -> dict:
+    """The AI makes the final picture. The server only checks it (same person, same clothes, face in
+    place) and asks the AI again with a note on what went wrong if a check fails; the best is kept."""
+    # Skin smoothing on HER real face (tone, blemishes, noise; features and shape untouched), done on the
+    # photo before the AI sees it. The AI is then told to keep that face exactly and builds everything
+    # else around it, so the result is one natural photo with her own unchanged face.
+    body = None
+    if seg_src is not None:
+        body = cv2.GaussianBlur(np.clip((seg_src[..., BODY_SKIN] - 0.3) / 0.4, 0, 1), (0, 0), max(2.0, 0.01 * OUT_W))
+    sent = clean_photo(crop, lm, src_scale)
+    if FACE_ENHANCE > 0:
+        sent = beautify(sent, lm, FACE_ENHANCE, style="natural", skin_extra=body)
+    # Protect the face (brows to chin) in the AI edit; the forehead/hairline stays free for the wig
+    face_keep = keep_mask(crop.shape, lm, shrink=0.92)
+
+    outfit = await describe_outfit(crop)
+    if outfit:
+        log.info("outfit: %s", outfit)
+    best, note, tries = None, "", 0
+    for attempt in range(TRYON_ATTEMPTS):
+        tries += 1
+        out = await ai_edit(sent, wig_rgb, build_prompt_pure(p, note, outfit), keep=face_keep)
+        out_lm = await landmarks(out)
+        seg_out = None
+        if seg_src is not None:
+            try:
+                seg_out = await segment(out)
+            except Exception:
+                seg_out = None
+        score, why = check_result(crop, lm, out, out_lm, seg_src, seg_out)
+        log.info("try-on attempt %d: score %.1f %s", tries, score, why or "(passed)")
+        if best is None or score < best[0]:
+            best = (score, out, seg_out, out_lm, why)
+        if score < 1.0:
+            break
+        note = why
+    score, out, seg_out, out_lm, why = best
+    # Her face stays her face: her own (smoothed) face goes back on the result, and the result's skin
+    # (neck, ears, chest) is first brought to her exact skin colour so there is no edge where they meet.
+    locked = False
+    if SKIN_TONE > 0 and seg_src is not None and seg_out is not None:
+        gap = skin_tone_gap(sent, seg_src, out, seg_out)
+        out = keep_skin_tone(sent, seg_src, out, seg_out, SKIN_TONE, exact=KEEP_FACE)
+        log.info("skin tone kept (was off by L %.1f, colour %.1f)", *(gap or (0, 0)))
+    if KEEP_FACE:
+        out, locked = face_lock(sent, lm, out, out_lm, bool(p.get("bangs")), enhance=0, relight=0.4)
+        log.info("her own face kept: %s", locked)
+    before = crop
+    if added is not None and added.any():
+        a_ = cv2.GaussianBlur(added.astype(np.float32), (0, 0), 3)[..., None]
+        before = np.clip(crop * (1 - a_) + backdrop(OUT_H, OUT_W, "studio") * a_, 0, 255).astype(np.uint8)
+    mode = f"pure ai ({tries} attempt{'s' if tries > 1 else ''}, check score {score:.1f})"
+    log.info("try-on finished: mode=%s", mode)
+    return {"before": before, "after": out, "locked": True, "mode": mode}
 
 
 async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
@@ -369,6 +575,9 @@ async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
         own = cv2.dilate(own, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * g + 1, 2 * g + 1)))
         zone = np.maximum(zone, own)
         zone[skin_lock(seg_src, lm, bangs) > 0] = 0  # her real forehead/temples: the wig is built around them
+    if BLEND_MODE == "pure":
+        return await run_pure(crop, lm, wig_rgb, p, seg_src, added, src_scale=w / OUT_W)
+
     ai_mode = BLEND_MODE == "ai" and seg_src is not None
     if ai_mode:
         # The AI may repaint everything (face, hair, background) except her clothes.
