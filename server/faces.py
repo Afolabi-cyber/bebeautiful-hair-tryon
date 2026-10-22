@@ -1330,3 +1330,60 @@ def restore_clothes(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_o
     keep = cv2.GaussianBlur(keep * (1 - hair_block), (0, 0), 1.2)[..., None]
     res = src_w.astype(np.float32) * keep + res * (1 - keep)
     return _to_u8(res), f"kept (overlap {iou:.2f}, {float(keep.mean()) * 100:.0f}% of picture)"
+
+
+def keep_body(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np.ndarray,
+              M: np.ndarray) -> tuple[np.ndarray, str]:
+    """Her own body and clothes, always, by construction (whatever the AI drew there).
+
+    The AI's picture supplies only the new hair, the head and the backdrop. Her real clothes, arms,
+    hands and neck from her photo are placed exactly where they belong relative to her face (the face
+    was already put back the same way), under the new hair. Anything the AI invented outside her real
+    body (a new shirt, extra shoulders) becomes backdrop. Returns (image, note for the log)."""
+    H, W = out.shape[:2]
+    warp = lambda x, f=cv2.INTER_LINEAR, b=cv2.BORDER_CONSTANT: cv2.warpAffine(x, M, (W, H), flags=f, borderMode=b)
+    src_w = warp(src, b=cv2.BORDER_REPLICATE).astype(np.float32)
+    seg_w = np.stack([warp(np.ascontiguousarray(seg_src[..., i])) for i in range(seg_src.shape[-1])], -1)
+    body = np.clip(seg_w[..., CLOTHES] + seg_w[..., BODY_SKIN], 0, 1)
+    near = cv2.dilate((body > 0.5).astype(np.uint8), np.ones((int(0.05 * W) | 1,) * 2, np.uint8)).astype(np.float32)
+    body = np.clip(body + seg_w[..., OTHERS] * near, 0, 1)  # bags, straps, jewellery on her
+    if (body > 0.5).sum() < 1500:
+        return out, "no body to keep"
+    old_hair = seg_w[..., HAIR]
+    new_hair = seg_out[..., HAIR]
+    res = _lab(out)
+
+    # 1. The AI's clothes take her garment's colours (for any bit of them that stays visible).
+    c_src, c_out = seg_w[..., CLOTHES] > 0.5, (seg_out[..., CLOTHES] > 0.5) & (new_hair < 0.35)
+    if c_src.sum() > 800 and c_out.sum() > 800:
+        ls = _lab(src_w)
+        mr, sr = ls[c_src].mean(0), ls[c_src].std(0) + 1e-3
+        mo, so = res[c_out].mean(0), res[c_out].std(0) + 1e-3
+        moved = (res - mo) * np.clip(sr / so, 0.6, 1.6) + mr
+        w = cv2.GaussianBlur(np.clip((seg_out[..., CLOTHES] - 0.3) / 0.4, 0, 1).astype(np.float32), (0, 0), 1.5)
+        w = (w * (1 - np.clip((new_hair - 0.35) / 0.3, 0, 1)))[..., None]
+        res = res * (1 - w) + moved * w
+    res = _rgb(res)
+
+    # 2. Body the AI invented where her photo had only background: plain backdrop instead.
+    ai_body = np.clip(seg_out[..., CLOTHES] + seg_out[..., BODY_SKIN] + seg_out[..., OTHERS], 0, 1)
+    was_bg = (body < 0.3) & (old_hair < 0.3) & (seg_w[..., FACE_SKIN] < 0.3)
+    invented = ((ai_body > 0.5) & was_bg & (new_hair < 0.35)).astype(np.uint8)
+    invented = cv2.morphologyEx(invented, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    if invented.any():
+        bgm = cv2.erode((seg_out[..., BG] > 0.7).astype(np.uint8), np.ones((7, 7), np.uint8)).astype(np.float32)
+        sig = max(8.0, 0.08 * W)
+        num = cv2.GaussianBlur(out.astype(np.float32) * bgm[..., None], (0, 0), sig)
+        den = cv2.GaussianBlur(bgm, (0, 0), sig)[..., None]
+        fallback = np.median(out[bgm > 0], axis=0).astype(np.float32) if bgm.sum() > 500 else np.float32([225, 225, 225])
+        plate = np.where(den > 0.05, num / np.maximum(den, 1e-3), fallback)
+        a = cv2.GaussianBlur(cv2.dilate(invented, np.ones((11, 11), np.uint8)).astype(np.float32), (0, 0), 3.0)
+        a = (a * (1 - np.clip((new_hair - 0.2) / 0.3, 0, 1)))[..., None]  # never wash out the new hair
+        res = res * (1 - a) + plate * a
+
+    # 3. Her real body on top, under the new hair. Edge pulled in 1 px so none of her old room shows.
+    keep = cv2.erode((body > 0.5).astype(np.uint8), np.ones((3, 3), np.uint8)).astype(np.float32)
+    block = cv2.dilate((new_hair > 0.35).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    keep = cv2.GaussianBlur(keep * (1 - block), (0, 0), 1.0)[..., None]
+    res = src_w * keep + res * (1 - keep)
+    return _to_u8(res), f"kept ({float(keep.mean()) * 100:.0f}% of picture, {int(invented.sum())} invented px removed)"
