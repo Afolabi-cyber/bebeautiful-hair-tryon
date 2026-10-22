@@ -23,7 +23,7 @@ import catalog_store
 import db
 from status import STATUS
 from admin import router as admin_router
-from faces import CLOTHES, FACE_OVAL, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, make_room, Segmenter, hair_zone, head_crop, keep_mask, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
+from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -38,6 +38,8 @@ RESULT_BACKGROUND = os.getenv("RESULT_BACKGROUND", "studio").lower()
 BLEND_MODE = os.getenv("BLEND_MODE", "pure").strip().lower()
 # "pure" (default): the AI makes the final picture; the server only prepares the photo and checks the
 # result (same person, same clothes), regenerating if a check fails. Nothing is pasted back in.
+# 1 = the result keeps her exact skin tone, 0 = whatever the AI drew
+SKIN_TONE = max(0.0, min(1.0, float(os.getenv("SKIN_TONE", "1"))))
 TRYON_ATTEMPTS = max(1, min(3, int(os.getenv("TRYON_ATTEMPTS", "2"))))
 FACE_ENHANCE = min(1.0, max(0.0, float(os.getenv("FACE_ENHANCE", "0.75"))))  # retouch strength: 0 = off, 0.75 = default, 1 = strongest
 OUT_W, OUT_H = 1024, 1536
@@ -194,7 +196,7 @@ def build_prompt_pure(p: dict, retry_note: str = "") -> str:
     return (
         "Image 1 is a photo of a customer. Image 2 is a product photo of a wig (shown on its own, face area empty).\n"
         f"Wig: {desc}.\n\n"
-        "Create ONE finished, photorealistic beauty portrait of the customer from image 1 wearing this exact wig, as if "
+        "Create ONE finished, photorealistic portrait of the customer from image 1 wearing this exact wig, as if "
         "photographed in a professional studio. It must look like a real photograph, never like a collage or an edit.\n\n"
         "THE WIG: reproduce image 2 faithfully: the same braid size and pattern, parting, curl type and where the curls "
         "start, the same colours and ombre in the same places, the same length, density and fullness. Do not invent a "
@@ -203,16 +205,15 @@ def build_prompt_pure(p: dict, retry_note: str = "") -> str:
         "covers both ears completely and falls naturally over the shoulders and down the front and back, as long as the "
         "wig is, with real volume, shadows and light, casting soft shadows on the neck and shoulders where it touches "
         "them. Completely hide her own hair and anything on her head (scarf, cap, hood, headphones, bonnet) under the wig.\n\n"
-        "THE FACE: it must be unmistakably the same person: exactly the same face shape and size, eyes, eye shape and "
-        "spacing, eyebrows, nose, lips, jaw, chin, ears hidden, age, expression and exactly the same skin tone (never "
-        "lighter, darker or greyer). Keep the head exactly where it is in image 1, at the same size and angle. Give the "
-        "face a professional beauty retouch: smooth, even, flawless-looking skin with a soft healthy glow, blemishes, "
-        "spots, shine and dark circles removed, neat brows, subtle natural lip colour, but keep a natural skin texture "
-        "so it never looks plastic or painted. Keep glasses only if she is wearing them; do not add glasses, earrings, "
-        "jewellery or anything else she is not wearing.\n\n"
+        "THE FACE: the face in image 1 is already professionally retouched. Keep it EXACTLY as it is: do not redraw, "
+        "reshape, resize, smooth, sharpen, slim, enlarge the eyes or change it in any way. The same face shape, eyes, "
+        "eyebrows, nose, lips, jaw, chin, expression, skin texture and exactly the same skin tone and complexion. Do not lighten, brighten, whiten, darken or tint her skin, and do not airbrush it: the natural skin texture stays. Keep the head exactly "
+        "where it is in image 1, at the same size and angle. Only the hairline at the top of the forehead and the hair "
+        "around the face are new. Keep glasses only if she is wearing them; do not add glasses, earrings, jewellery or "
+        "anything else she is not wearing.\n\n"
         "THE CLOTHES: keep her clothing exactly as in image 1: the same garment, colour, pattern, print, neckline, collar "
         "and fit, and keep any necklace. The wig's hair may fall in front of the clothes.\n\n"
-        "THE PHOTO: soft, even, flattering studio light that is the same on the face, hair, neck and clothes. A plain, "
+        "THE PHOTO: soft, even studio light that is the same on the face, hair, neck and clothes and keeps her real skin tone. A plain, "
         "seamless, softly lit light grey-white studio backdrop, with nothing else in the background. Head-and-shoulders "
         "framing as in image 1. If any part of image 1 is blurred or empty at the edges, continue the hair, shoulders "
         "and backdrop naturally there. Sharp, clean, high quality, photorealistic."
@@ -259,6 +260,15 @@ def check_result(crop: np.ndarray, lm: np.ndarray, out: np.ndarray, out_lm, seg_
             if dab > 9 or dL > 30:
                 score += max(dab - 9, 0) + max(dL - 30, 0) * 0.5 + 5
                 why.append("her clothes changed colour; keep her clothing exactly as in image 1")
+        gap = skin_tone_gap(crop, seg_src, out, seg_out)
+        if gap is not None:
+            dL, dc = gap
+            # lightness only: the colour of her photo is often off (office or bulb light), not her skin
+            if abs(dL) > 7:
+                score += (abs(dL) - 7) * 0.5 + 2
+                how = "lighter" if dL > 0 else "darker"
+                why.append(f"her skin was made {how}; keep exactly her own skin tone from image 1, "
+                           "do not lighten, brighten or airbrush her skin")
     return score, "; ".join(why)
 
 
@@ -405,7 +415,7 @@ async def tryon(req: Request, session_id: str = Form(...), wig_id: str = Form(..
     return out
 
 
-async def ai_edit(crop: np.ndarray, wig_rgb: np.ndarray, prompt: str) -> np.ndarray:
+async def ai_edit(crop: np.ndarray, wig_rgb: np.ndarray, prompt: str, keep: np.ndarray | None = None) -> np.ndarray:
     kwargs = dict(
         model=MODEL,
         image=[("customer.png", encode(crop), "image/png"), ("wig.png", encode(wig_rgb), "image/png")],
@@ -415,6 +425,8 @@ async def ai_edit(crop: np.ndarray, wig_rgb: np.ndarray, prompt: str) -> np.ndar
         output_format="png",
         n=1,
     )
+    if keep is not None:
+        kwargs["mask"] = ("mask.png", openai_mask_png(keep), "image/png")  # opaque = do not edit
     if supports_fidelity(MODEL):
         kwargs["input_fidelity"] = "high"
     try:
@@ -430,13 +442,26 @@ async def ai_edit(crop: np.ndarray, wig_rgb: np.ndarray, prompt: str) -> np.ndar
     return out
 
 
-async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dict, seg_src, added) -> dict:
+async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dict, seg_src, added,
+                   src_scale: float = 1.0) -> dict:
     """The AI makes the final picture. The server only checks it (same person, same clothes, face in
     place) and asks the AI again with a note on what went wrong if a check fails; the best is kept."""
+    # Skin smoothing on HER real face (tone, blemishes, noise; features and shape untouched), done on the
+    # photo before the AI sees it. The AI is then told to keep that face exactly and builds everything
+    # else around it, so the result is one natural photo with her own unchanged face.
+    body = None
+    if seg_src is not None:
+        body = cv2.GaussianBlur(np.clip((seg_src[..., BODY_SKIN] - 0.3) / 0.4, 0, 1), (0, 0), max(2.0, 0.01 * OUT_W))
+    sent = clean_photo(crop, lm, src_scale)
+    if FACE_ENHANCE > 0:
+        sent = beautify(sent, lm, FACE_ENHANCE, style="natural", skin_extra=body)
+    # Protect the face (brows to chin) in the AI edit; the forehead/hairline stays free for the wig
+    face_keep = keep_mask(crop.shape, lm, shrink=0.92)
+
     best, note, tries = None, "", 0
     for attempt in range(TRYON_ATTEMPTS):
         tries += 1
-        out = await ai_edit(crop, wig_rgb, build_prompt_pure(p, note))
+        out = await ai_edit(sent, wig_rgb, build_prompt_pure(p, note), keep=face_keep)
         out_lm = await landmarks(out)
         seg_out = None
         if seg_src is not None:
@@ -447,11 +472,16 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
         score, why = check_result(crop, lm, out, out_lm, seg_src, seg_out)
         log.info("try-on attempt %d: score %.1f %s", tries, score, why or "(passed)")
         if best is None or score < best[0]:
-            best = (score, out)
+            best = (score, out, seg_out)
         if score < 1.0:
             break
         note = why
-    score, out = best
+    score, out, seg_out = best
+    # Her own skin tone on the result (one soft colour shift on the skin only, no pasting, no edges)
+    if SKIN_TONE > 0 and seg_src is not None and seg_out is not None:
+        gap = skin_tone_gap(sent, seg_src, out, seg_out)
+        out = keep_skin_tone(sent, seg_src, out, seg_out, SKIN_TONE)
+        log.info("skin tone kept (was off by L %.1f, colour %.1f)", *(gap or (0, 0)))
     before = crop
     if added is not None and added.any():
         a_ = cv2.GaussianBlur(added.astype(np.float32), (0, 0), 3)[..., None]
@@ -502,7 +532,7 @@ async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
         zone = np.maximum(zone, own)
         zone[skin_lock(seg_src, lm, bangs) > 0] = 0  # her real forehead/temples: the wig is built around them
     if BLEND_MODE == "pure":
-        return await run_pure(crop, lm, wig_rgb, p, seg_src, added)
+        return await run_pure(crop, lm, wig_rgb, p, seg_src, added, src_scale=w / OUT_W)
 
     ai_mode = BLEND_MODE == "ai" and seg_src is not None
     if ai_mode:
