@@ -24,7 +24,7 @@ import catalog_store
 import db
 from status import STATUS
 from admin import router as admin_router
-from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, added_hands, head_gaps, keep_body, match_backdrop, no_new_hands, tidy_body, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
+from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, added_hands, face_match, head_gaps, neck_band, keep_body, match_backdrop, no_new_hands, tidy_body, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -56,6 +56,10 @@ KEEP_CLOTHES = os.getenv("KEEP_CLOTHES", "on").lower() not in ("0", "off", "fals
 # "ai": the AI does a very light skin retouch and its face is used, but only if the identity check passed
 # (same features, same face shape); otherwise her real face goes back. "photo": always her real face.
 FACE_SOURCE = os.getenv("FACE_SOURCE", "ai").strip().lower()
+# how closely the AI face's eyes, brows, nose and mouth must look like hers (0..1) to be used
+FACE_MATCH_MIN = float(os.getenv("FACE_MATCH_MIN", "0.55"))
+# light smoothing of her real face when it is used instead of the AI's (FACE_ENHANCE 0)
+FALLBACK_SMOOTH = float(os.getenv("FALLBACK_SMOOTH", "0.6"))
 KEEP_FACE = os.getenv("KEEP_FACE", "on").lower() not in ("0", "off", "false", "no")
 SKIN_TONE = max(0.0, min(1.0, float(os.getenv("SKIN_TONE", "1"))))
 TRYON_ATTEMPTS = max(1, min(3, int(os.getenv("TRYON_ATTEMPTS", "3"))))
@@ -219,7 +223,9 @@ def build_prompt_pure(p: dict, retry_note: str = "", outfit: str = "") -> str:
         "her face, her body, her pose, her hands and arms, her clothes and jewellery, their position, size and "
         "lighting. Do not re-imagine, re-pose or re-shoot her. The result must look like a real photograph, never like "
         "a collage.\n\n"
-        "THE WIG: reproduce image 2 faithfully: the same braid size and pattern, parting, curl type and where the curls "
+        "THE PARTING: the hair is parted EXACTLY IN THE MIDDLE of her head, a straight centre part from the forehead "
+        "to the crown, with the hair falling evenly to both sides (even if image 2 shows a side part).\n\n"
+        "THE WIG: reproduce image 2 faithfully: the same braid size and pattern, curl type and where the curls "
         "start, the same colours and ombre in the same places, the same length, density and fullness. Do not invent a "
         "different style. Fit it like a professionally installed wig: flush and snug on the scalp, the top close to the "
         "head, a soft natural hairline blending into her forehead and temples, no visible lace, cap or edges. The hair "
@@ -645,7 +651,8 @@ async def fill_head_gaps(out: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p
         desc = p.get("description") or p["name"]
         prompt = ("Image 2 is the wig she is wearing (" + desc + "). In the editable area beside her head, add the same "
                   "wig hair so the wig covers her whole head like a real, properly installed wig: the same braids, "
-                  "colours and style, lying flat on the scalp from the part, covering the ear and falling down "
+                  "colours and style, parted in the middle, lying flat on the scalp from the centre part, falling over "
+                  "BOTH shoulders, covering the ear and falling down "
                   "naturally, joined seamlessly to the hair that is already there. No bare scalp, gap or background "
                   "around her head. Do not change her face, skin, clothes or anything outside the editable area. "
                   "Keep the plain " + BACKDROP_WORDS + " backdrop. Photorealistic.")
@@ -734,11 +741,16 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
     # The AI's lightly retouched face is used only when it is provably still her face; otherwise hers goes back
     face_ok = FACE_SOURCE == "ai" and out_lm is not None and "facial features changed" not in why \
         and "moved or changed size" not in why and "made smaller or bigger" not in why
+    likeness = face_match(sent, lm, out, out_lm) if face_ok else 0.0
+    if face_ok and likeness < FACE_MATCH_MIN:
+        face_ok = False  # features are in place but don't look like hers closely enough
     if KEEP_FACE and not face_ok:
-        out, locked = face_lock(sent, lm, out, out_lm, bool(p.get("bangs")), enhance=0, relight=0.0)
-        log.info("her own face kept: %s", locked)
+        # her real face, with a light smoothing so the result is still retouched
+        mine = sent if FACE_ENHANCE > 0 else beautify(sent, lm, FALLBACK_SMOOTH, style="natural", skin_extra=body)
+        out, locked = face_lock(mine, lm, out, out_lm, bool(p.get("bangs")), enhance=0, relight=0.0)
+        log.info("her own face kept (AI face likeness %.2f): %s", likeness, locked)
     else:
-        log.info("AI's lightly retouched face used (identity check passed)")
+        log.info("AI's lightly retouched face used (likeness %.2f)", likeness)
     # Her clothes stay her clothes, by construction: her real body and clothes from her photo, placed
     # relative to her face exactly as in her photo, under the new hair; anything the AI invented
     # outside her body becomes backdrop.
@@ -754,7 +766,8 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
             # Always her real pose: her arms and hands exactly where they are in her photo. Whatever the AI
             # drew elsewhere (moved hands, extra arms) becomes backdrop; the blend pass smooths the result.
             out, how = keep_body(sent, seg_src, out, seg_out, M,
-                                 valid=None if added is None else ~added)
+                                 valid=None if added is None else ~added,
+                                 no_paste=neck_band(out.shape, out_lm) if face_ok else None)
             how += f", match {fit[2]:.2f}" if fit is not None else ""
             # Also blend when a visible amount of what the AI drew had to be taken out (that leaves hard
             # cut-out edges which only the blend pass can make natural)
