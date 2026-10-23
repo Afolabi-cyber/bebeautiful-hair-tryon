@@ -56,6 +56,11 @@ KEEP_CLOTHES = os.getenv("KEEP_CLOTHES", "on").lower() not in ("0", "off", "fals
 # "ai": the AI does a very light skin retouch and its face is used, but only if the identity check passed
 # (same features, same face shape); otherwise her real face goes back. "photo": always her real face.
 # on: the AI does everything and its picture is returned as is (tested: it changes face and clothes). Default off.
+# Image AI: "gemini" (Google Nano Banana 2.1: keeps the person, pose and clothes far more faithfully and takes the wig
+# photo as a reference) or "openai". Gemini is used when GEMINI_API_KEY is set; if a Gemini call fails, OpenAI is used.
+IMAGE_PROVIDER = os.getenv("IMAGE_PROVIDER", "gemini" if os.getenv("GEMINI_API_KEY") else "openai").strip().lower()
+GEMINI_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-nano-banana-2.1")
+GEMINI_SIZE = os.getenv("GEMINI_IMAGE_SIZE", "1K")
 AI_ONLY = os.getenv("AI_ONLY", "off").lower() not in ("0", "off", "false", "no")
 HEADWEAR_CHECK = os.getenv("HEADWEAR_CHECK", "on").lower() not in ("0", "off", "false", "no")
 LOWER_HAIRLINE = os.getenv("LOWER_HAIRLINE", "off").lower() not in ("0", "off", "false", "no")
@@ -622,8 +627,68 @@ async def describe_outfit(crop: np.ndarray) -> str:
         return ""
 
 
+def _find_image_b64(obj):
+    """The last image (base64) anywhere in a Gemini interactions response."""
+    found = None
+    if isinstance(obj, dict):
+        if obj.get("type") == "image" and isinstance(obj.get("data"), str):
+            found = obj["data"]
+        for v in obj.values():
+            f = _find_image_b64(v)
+            if f:
+                found = f
+    elif isinstance(obj, list):
+        for v in obj:
+            f = _find_image_b64(v)
+            if f:
+                found = f
+    return found
+
+
+async def gemini_edit(crop: np.ndarray, wig_rgb: np.ndarray | None, prompt: str) -> np.ndarray:
+    """Google Gemini image edit: her photo (+ the wig photo as reference) and the instruction -> new picture."""
+    import httpx
+    key = os.getenv("GEMINI_API_KEY", "")
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+    if wig_rgb is not None:
+        # Google's recommended pattern for edits that must keep a person exactly (their "high-fidelity detail
+        # preservation" template), followed by our full instruction
+        prompt = ("Using the provided images, place the wig from the second image onto the person in the first image. "
+                  "Ensure that the person's face, facial features, skin tone, expression, body, pose, clothes and "
+                  "framing from the first image remain completely unchanged; only their hair and the background "
+                  "change. The wig must sit naturally on the head like a real, professionally installed wig.\n\n"
+                  + prompt)
+    parts = [{"type": "text", "text": prompt},
+             {"type": "image", "mime_type": "image/jpeg", "data": base64.b64encode(encode(crop, ".jpg", 95)).decode()}]
+    if wig_rgb is not None:
+        parts.append({"type": "image", "mime_type": "image/jpeg",
+                      "data": base64.b64encode(encode(wig_rgb, ".jpg", 95)).decode()})
+    body = {"model": GEMINI_MODEL, "input": parts,
+            "response_format": {"type": "image", "mime_type": "image/png", "aspect_ratio": "2:3",
+                                "image_size": GEMINI_SIZE}}
+    async with httpx.AsyncClient(timeout=180) as http:
+        r = await http.post("https://generativelanguage.googleapis.com/v1beta/interactions",
+                            headers={"x-goog-api-key": key, "Content-Type": "application/json"}, json=body)
+    if r.status_code != 200:
+        raise RuntimeError(f"Gemini {r.status_code}: {r.text[:300]}")
+    b64 = _find_image_b64(r.json())
+    if not b64:
+        raise RuntimeError("Gemini returned no image")
+    out = to_rgb(base64.b64decode(b64))
+    if out.shape[:2] != (OUT_H, OUT_W):
+        out = cv2.resize(out, (OUT_W, OUT_H), interpolation=cv2.INTER_CUBIC if out.shape[1] < OUT_W else cv2.INTER_AREA)
+    return out
+
+
 async def ai_edit(crop: np.ndarray, wig_rgb: np.ndarray | None, prompt: str, keep: np.ndarray | None = None,
                   quality: str | None = None) -> np.ndarray:
+    if IMAGE_PROVIDER == "gemini":
+        try:
+            # Gemini has no edit mask; the face, body and clothes are protected by the instruction and put back after
+            return await gemini_edit(crop, wig_rgb, prompt)
+        except Exception as e:
+            log.warning("Gemini image edit failed, using OpenAI instead: %s", e)
     images = [("customer.png", encode(crop), "image/png")]
     if wig_rgb is not None:
         images.append(("wig.png", encode(wig_rgb), "image/png"))
@@ -913,7 +978,9 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
             needs_blend = fit is not None and fit[2] < BLEND_BELOW
             # Always her real pose: her arms and hands exactly where they are in her photo. Whatever the AI
             # drew elsewhere (moved hands, extra arms) becomes backdrop; the blend pass smooths the result.
-            out, how = keep_body(sent, seg_src, out, seg_out, M,
+            # Her clothes go only INSIDE the body the AI drew (never cutting its hair or punching pink holes where
+            # her photo's pose differs); the AI's own body outline, arms and hair stay as drawn
+            out, how = keep_body(sent, seg_src, out, seg_out, M, follow=True,
                                  valid=None if added is None else ~added,
                                  no_paste=neck_band(out.shape, out_lm) if face_ok else None)
             how += f", match {fit[2]:.2f}" if fit is not None else ""
