@@ -1141,19 +1141,38 @@ async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
         own = cv2.dilate(own, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * g + 1, 2 * g + 1)))
         zone = np.maximum(zone, own)
         zone[skin_lock(seg_src, lm, bangs) > 0] = 0  # her real forehead/temples: the wig is built around them
-    # Gemini: her original photo + the wig -> one edit (wig on, light skin smoothing, pink background) -> shown as is
-    if IMAGE_PROVIDER == "gemini" and SIMPLE_EDIT:
-        try:
-            out = await gemini_edit(crop, wig_rgb, build_prompt_gemini(p))
-            before = crop
-            if added is not None and added.any():
-                a_ = cv2.GaussianBlur(added.astype(np.float32), (0, 0), 3)[..., None]
-                before = np.clip(crop * (1 - a_) + np.full((OUT_H, OUT_W, 3), BACKDROP_RGB, np.float32) * a_,
-                                 0, 255).astype(np.uint8)
-            log.info("try-on finished: mode=gemini simple edit")
-            return {"before": before, "after": out, "locked": True, "mode": "gemini simple edit"}
-        except Exception as e:
-            log.warning("Gemini edit failed, using the full pipeline instead: %s", e)
+    # One edit of her original photo (wig on, light skin smoothing, pink background), shown exactly as it comes back.
+    # Nothing is pasted, cut or patched on the result. Gemini first (2 tries); OpenAI only if Gemini is unavailable.
+    if SIMPLE_EDIT:
+        prompt = build_prompt_gemini(p)
+        out, made = None, ""
+        if os.getenv("GEMINI_API_KEY"):
+            for t in range(2):
+                try:
+                    out, made = await gemini_edit(crop, wig_rgb, prompt), "gemini"
+                    break
+                except Exception as e:
+                    log.warning("Gemini edit failed (try %d): %s", t + 1, e)
+        if out is None:
+            kw = dict(model=MODEL, image=[("customer.png", encode(crop), "image/png"), ("wig.png", encode(wig_rgb), "image/png")],
+                      prompt=prompt, size=f"{OUT_W}x{OUT_H}", quality=QUALITY, output_format="png", n=1)
+            if supports_fidelity(MODEL):
+                kw["input_fidelity"] = "high"
+            try:
+                res = await openai_client().images.edit(**kw)
+            except APIStatusError as e:
+                log.warning("OpenAI error %s: %s", e.status_code, e.message)
+                raise HTTPException(502, "The AI is busy right now, please try again.")
+            out, made = to_rgb(base64.b64decode(res.data[0].b64_json)), "openai"
+            if out.shape[:2] != (OUT_H, OUT_W):
+                out = cv2.resize(out, (OUT_W, OUT_H), interpolation=cv2.INTER_CUBIC)
+        before = crop
+        if added is not None and added.any():
+            a_ = cv2.GaussianBlur(added.astype(np.float32), (0, 0), 3)[..., None]
+            before = np.clip(crop * (1 - a_) + np.full((OUT_H, OUT_W, 3), BACKDROP_RGB, np.float32) * a_,
+                             0, 255).astype(np.uint8)
+        log.info("try-on finished: mode=simple edit (%s)", made)
+        return {"before": before, "after": out, "locked": True, "mode": f"simple edit ({made})"}
     if AI_ONLY:
         return await run_ai_only(crop, lm, wig_rgb, p, seg_src, added)
     if BLEND_MODE == "pure":
