@@ -60,7 +60,7 @@ AI_ONLY = os.getenv("AI_ONLY", "off").lower() not in ("0", "off", "false", "no")
 HEADWEAR_CHECK = os.getenv("HEADWEAR_CHECK", "on").lower() not in ("0", "off", "false", "no")
 LOWER_HAIRLINE = os.getenv("LOWER_HAIRLINE", "off").lower() not in ("0", "off", "false", "no")
 HAIRLINE_HINT = os.getenv("HAIRLINE_HINT", "off").lower() not in ("0", "off", "false", "no")
-FACE_SOURCE = os.getenv("FACE_SOURCE", "ai").strip().lower()
+FACE_SOURCE = os.getenv("FACE_SOURCE", "photo").strip().lower()
 # how closely the AI face's eyes, brows, nose and mouth must look like hers (0..1) to be used
 FACE_MATCH_MIN = float(os.getenv("FACE_MATCH_MIN", "0.55"))
 # light smoothing of her real face when it is used instead of the AI's (FACE_ENHANCE 0)
@@ -879,7 +879,8 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
         out = keep_skin_tone(sent, seg_src, out, seg_out, SKIN_TONE, exact=KEEP_FACE)
         log.info("skin tone kept (was off by L %.1f, colour %.1f)", *(gap or (0, 0)))
     # The AI's lightly retouched face is used only when it is provably still her face; otherwise hers goes back
-    face_ok = FACE_SOURCE == "ai" and out_lm is not None and "facial features changed" not in why \
+    # The AI's face is only ever used when it passed every face check (score below 10 means no face problem)
+    face_ok = FACE_SOURCE == "ai" and out_lm is not None and score < 10 and "face" not in why \
         and "moved or changed size" not in why and "made smaller or bigger" not in why
     likeness = face_match(sent, lm, out, out_lm) if face_ok else 0.0
     if face_ok and likeness < FACE_MATCH_MIN:
@@ -887,11 +888,15 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
     if KEEP_FACE and not face_ok:
         # her real face, with a light smoothing so the result is still retouched
         mine = sent if FACE_ENHANCE > 0 else beautify(sent, lm, FALLBACK_SMOOTH, style="natural", skin_extra=body)
-        out, locked = face_lock(mine, lm, out, out_lm, bool(p.get("bangs")), enhance=0, relight=0.0,
-                                ai_hair=None if seg_out is None else seg_out[..., HAIR])
+        hair_ai = None if seg_out is None else seg_out[..., HAIR]
+        out, locked = face_lock(mine, lm, out, out_lm, bool(p.get("bangs")), enhance=0, relight=0.0, ai_hair=hair_ai)
+        if not locked and out_lm is not None:  # the AI moved or reshaped the head: still put her own face back
+            out, locked = face_lock(mine, lm, out, out_lm, bool(p.get("bangs")), enhance=0, relight=0.0,
+                                    ai_hair=hair_ai, strict=False)
         log.info("her own face kept (AI face likeness %.2f): %s", likeness, locked)
-        if seg_out is not None:  # one skin tone from chin to hairline: no lighter "bald" block above the brows
-            out = match_forehead(out, seg_out, out_lm)
+        # Do not recolour the forehead after face-locking. Segmentation can label forehead skin
+        # inconsistently; shifting its LAB colour creates the visible rectangular/patchy marks.
+        # The original forehead is preserved by face_lock and the wig remains in front where detected.
     else:
         log.info("AI's lightly retouched face used (likeness %.2f)", likeness)
     # Her clothes stay her clothes, by construction: her real body and clothes from her photo, placed
