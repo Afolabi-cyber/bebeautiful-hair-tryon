@@ -1333,7 +1333,8 @@ def restore_clothes(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_o
 
 
 def keep_body(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np.ndarray,
-              M: np.ndarray, inset: int = 1, follow: bool = False) -> tuple[np.ndarray, str]:
+              M: np.ndarray, inset: int = 2, follow: bool = False,
+              valid: np.ndarray | None = None) -> tuple[np.ndarray, str]:
     """Her own body and clothes, always, by construction (whatever the AI drew there).
 
     The AI's picture supplies only the new hair, the head and the backdrop. Her real clothes, arms,
@@ -1383,13 +1384,19 @@ def keep_body(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np
     #    (skipped on the blended pass: there the AI already finished those edges)
     ai_body = np.clip(seg_out[..., CLOTHES] + seg_out[..., BODY_SKIN] + seg_out[..., OTHERS], 0, 1)
     was_bg = (body < 0.3) & (old_hair < 0.3) & (seg_w[..., FACE_SKIN] < 0.3)
+    # Only where her photo really shows background. Outside her photo (below its bottom edge, the room
+    # added above/beside a close selfie) the AI's drawing is the only picture there is, so it stays.
+    cover = np.ones(src.shape[:2], np.float32) if valid is None else valid.astype(np.float32)
+    cover = warp(cover) > 0.99
+    cover = cv2.erode(cover.astype(np.uint8), np.ones((int(0.03 * W) | 1,) * 2, np.uint8)).astype(bool)
+    was_bg &= cover
     invented = ((ai_body > 0.5) & was_bg & (new_hair < 0.35)).astype(np.uint8)
     invented = cv2.morphologyEx(invented, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     # follow = the AI re-posed her: keep its pose (her arms where it put them), so nothing of her old
     # pose is pasted where the result has no body (no floating sleeves or hands)
     # Only on the first assembly. After the AI blend pass its edges, shadows and the surface under her
     # arms are what make the picture whole, so they stay (stray pieces are caught by tidy_body).
-    if invented.any() and not follow and inset <= 1:
+    if invented.any() and not follow and inset <= 2:
         bgm = cv2.erode((seg_out[..., BG] > 0.7).astype(np.uint8), np.ones((7, 7), np.uint8)).astype(np.float32)
         sig = max(8.0, 0.08 * W)
         num = cv2.GaussianBlur(out.astype(np.float32) * bgm[..., None], (0, 0), sig)
