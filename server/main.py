@@ -63,6 +63,8 @@ IMAGE_PROVIDER = os.getenv("IMAGE_PROVIDER", "gemini" if os.getenv("GEMINI_API_K
 GEMINI_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-nano-banana-2.1")
 GEMINI_SIZE = os.getenv("GEMINI_IMAGE_SIZE", "1K")
 _made_by: ContextVar[str] = ContextVar("made_by", default="openai")  # which AI made the last picture (this request)
+# on: with Gemini, the try-on is exactly one edit of her photo (wig, light smoothing, background) and nothing else
+SIMPLE_EDIT = os.getenv("SIMPLE_EDIT", "on").lower() not in ("0", "off", "false", "no")
 AI_ONLY = os.getenv("AI_ONLY", "off").lower() not in ("0", "off", "false", "no")
 HEADWEAR_CHECK = os.getenv("HEADWEAR_CHECK", "on").lower() not in ("0", "off", "false", "no")
 LOWER_HAIRLINE = os.getenv("LOWER_HAIRLINE", "off").lower() not in ("0", "off", "false", "no")
@@ -233,6 +235,48 @@ UNCOVER_PROMPT = (
     "bare scalp or extra forehead skin. Do not change her face, eyes, eyebrows, skin, skin tone, expression, glasses, "
     "jewellery, clothes, body, pose, framing or the background. Photorealistic, the same photo."
 )
+
+
+def build_prompt_gemini(p: dict, retry_note: str = "") -> str:
+    """Written the way Google's Nano Banana guide recommends for edits: say exactly what changes, then that
+    everything else stays exactly the same; describe the wanted result positively (naming unwanted things, such as
+    hands, makes the model draw them)."""
+    desc = p.get("description") or p["name"]
+    return (
+        "Using the provided images, change only the hair of the person in the first image to the wig shown in the "
+        "second image, and change only the background to a plain, seamless, evenly lit solid " + BACKDROP_WORDS +
+        " studio wall. Keep everything else in the first image exactly the same: the same face and facial features, "
+        "expression, skin tone, glasses and jewellery, the same body, pose, arms and hand positions, the same clothes, "
+        "and the same framing, size and position in the picture, as in a photo taken at the same moment.\n\n"
+        f"The wig ({desc}) is copied faithfully from the second image: the same braids, curls, colours and length. "
+        "It is worn like a real, professionally installed wig: it covers her whole head, with a thin natural centre "
+        "part, a full natural hairline sitting low at the top of her forehead and framing her face, and the hair "
+        "falling evenly over both shoulders and down her back, lying naturally over her clothes. Her own hair is "
+        "completely tucked under the wig. Her skin gets only a very light, natural smoothing. Photorealistic."
+        + (("\n\nImportant: " + " ".join(_positive_notes(retry_note))) if retry_note else "")
+    )
+
+
+def _positive_notes(note: str) -> list[str]:
+    """The checks' findings as positive instructions (Gemini follows 'keep her hands as they are' far better than
+    any wording that names extra hands)."""
+    out = []
+    n = note.lower()
+    if "hands" in n or "arms" in n:
+        out.append("Her arms and hands stay exactly where they are in the first image.")
+    if "face" in n or "features" in n:
+        out.append("Her face is exactly the face in the first image, unchanged.")
+    if "smaller or bigger" in n or "moved" in n or "framing" in n:
+        out.append("She stays exactly the same size and in the same place in the frame as in the first image.")
+    if "clothes" in n or "pose or body" in n:
+        out.append("Her clothes and pose are exactly as in the first image.")
+    if "bald" in n or "scalp" in n or "forehead" in n:
+        out.append("The wig's hairline sits low and full at the top of her forehead, covering the whole top of her head.")
+    if "does not cover" in n or "shoulder" in n:
+        out.append("The wig covers her whole head on both sides and its hair falls over both shoulders.")
+    if "skin was made" in n:
+        out.append("Her skin tone is exactly as in the first image.")
+    return out or ["Follow the instructions exactly."]
 
 
 def build_prompt_ai_only(p: dict, retry_note: str = "") -> str:
@@ -653,14 +697,6 @@ async def gemini_edit(crop: np.ndarray, wig_rgb: np.ndarray | None, prompt: str)
     key = os.getenv("GEMINI_API_KEY", "")
     if not key:
         raise RuntimeError("GEMINI_API_KEY is not set")
-    if wig_rgb is not None:
-        # Google's recommended pattern for edits that must keep a person exactly (their "high-fidelity detail
-        # preservation" template), followed by our full instruction
-        prompt = ("Using the provided images, place the wig from the second image onto the person in the first image. "
-                  "Ensure that the person's face, facial features, skin tone, expression, body, pose, clothes and "
-                  "framing from the first image remain completely unchanged; only their hair and the background "
-                  "change. The wig must sit naturally on the head like a real, professionally installed wig.\n\n"
-                  + prompt)
     parts = [{"type": "text", "text": prompt},
              {"type": "image", "mime_type": "image/jpeg", "data": base64.b64encode(encode(crop, ".jpg", 95)).decode()}]
     if wig_rgb is not None:
@@ -684,11 +720,11 @@ async def gemini_edit(crop: np.ndarray, wig_rgb: np.ndarray | None, prompt: str)
 
 
 async def ai_edit(crop: np.ndarray, wig_rgb: np.ndarray | None, prompt: str, keep: np.ndarray | None = None,
-                  quality: str | None = None) -> np.ndarray:
+                  quality: str | None = None, gemini_prompt: str | None = None,
+                  gemini_image: np.ndarray | None = None) -> np.ndarray:
     if IMAGE_PROVIDER == "gemini":
         try:
-            # Gemini has no edit mask; the face, body and clothes are protected by the instruction and put back after
-            img = await gemini_edit(crop, wig_rgb, prompt)
+            img = await gemini_edit(crop if gemini_image is None else gemini_image, wig_rgb, gemini_prompt or prompt)
             _made_by.set("gemini")
             return img
         except Exception as e:
@@ -925,7 +961,8 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
     for attempt in range(TRYON_ATTEMPTS):
         tries += 1
         out = await ai_edit(sent_ai, wig_rgb, build_prompt_pure(p, note, outfit),
-                            keep=None if FACE_SOURCE == "ai" else face_keep)  # ai: the face may be retouched
+                            keep=None if FACE_SOURCE == "ai" else face_keep,
+                            gemini_prompt=build_prompt_gemini(p, note), gemini_image=crop)
         out_lm = await landmarks(out)
         seg_out = None
         if seg_src is not None:
@@ -1104,6 +1141,19 @@ async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
         own = cv2.dilate(own, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * g + 1, 2 * g + 1)))
         zone = np.maximum(zone, own)
         zone[skin_lock(seg_src, lm, bangs) > 0] = 0  # her real forehead/temples: the wig is built around them
+    # Gemini: her original photo + the wig -> one edit (wig on, light skin smoothing, pink background) -> shown as is
+    if IMAGE_PROVIDER == "gemini" and SIMPLE_EDIT:
+        try:
+            out = await gemini_edit(crop, wig_rgb, build_prompt_gemini(p))
+            before = crop
+            if added is not None and added.any():
+                a_ = cv2.GaussianBlur(added.astype(np.float32), (0, 0), 3)[..., None]
+                before = np.clip(crop * (1 - a_) + np.full((OUT_H, OUT_W, 3), BACKDROP_RGB, np.float32) * a_,
+                                 0, 255).astype(np.uint8)
+            log.info("try-on finished: mode=gemini simple edit")
+            return {"before": before, "after": out, "locked": True, "mode": "gemini simple edit"}
+        except Exception as e:
+            log.warning("Gemini edit failed, using the full pipeline instead: %s", e)
     if AI_ONLY:
         return await run_ai_only(crop, lm, wig_rgb, p, seg_src, added)
     if BLEND_MODE == "pure":
