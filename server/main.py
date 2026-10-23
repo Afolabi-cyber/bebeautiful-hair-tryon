@@ -55,8 +55,8 @@ CLOTHES_STRICT = os.getenv("CLOTHES_STRICT", "off").lower() not in ("0", "off", 
 KEEP_CLOTHES = os.getenv("KEEP_CLOTHES", "on").lower() not in ("0", "off", "false", "no")
 # "ai": the AI does a very light skin retouch and its face is used, but only if the identity check passed
 # (same features, same face shape); otherwise her real face goes back. "photo": always her real face.
-# on (default): the AI does everything (wig on, face untouched, pink backdrop) and its picture is returned as is
-AI_ONLY = os.getenv("AI_ONLY", "on").lower() not in ("0", "off", "false", "no")
+# on: the AI does everything and its picture is returned as is (tested: it changes face and clothes). Default off.
+AI_ONLY = os.getenv("AI_ONLY", "off").lower() not in ("0", "off", "false", "no")
 HAIRLINE_HINT = os.getenv("HAIRLINE_HINT", "on").lower() not in ("0", "off", "false", "no")
 FACE_SOURCE = os.getenv("FACE_SOURCE", "ai").strip().lower()
 # how closely the AI face's eyes, brows, nose and mouth must look like hers (0..1) to be used
