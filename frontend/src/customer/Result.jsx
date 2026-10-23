@@ -139,7 +139,7 @@ async function brandedImage(src) {
   await document.fonts?.ready;
   ctx.fillStyle = "#fff";
   ctx.font = `400 ${Math.round(w * 0.044)}px "Young Serif", Georgia, serif`;
-  ctx.fillText("Own your look!", pad, h - pad - Math.round(w * 0.045));
+  ctx.fillText("Own your blend!", pad, h - pad - Math.round(w * 0.045));
   ctx.font = `500 ${Math.round(w * 0.027)}px "Reem Kufi", system-ui, sans-serif`;
   ctx.fillText("bebeautifulhair.com", pad, h - pad);
 
