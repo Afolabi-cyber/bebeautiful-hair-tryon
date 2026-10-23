@@ -59,7 +59,7 @@ KEEP_CLOTHES = os.getenv("KEEP_CLOTHES", "on").lower() not in ("0", "off", "fals
 AI_ONLY = os.getenv("AI_ONLY", "off").lower() not in ("0", "off", "false", "no")
 HEADWEAR_CHECK = os.getenv("HEADWEAR_CHECK", "on").lower() not in ("0", "off", "false", "no")
 LOWER_HAIRLINE = os.getenv("LOWER_HAIRLINE", "off").lower() not in ("0", "off", "false", "no")
-HAIRLINE_HINT = os.getenv("HAIRLINE_HINT", "on").lower() not in ("0", "off", "false", "no")
+HAIRLINE_HINT = os.getenv("HAIRLINE_HINT", "off").lower() not in ("0", "off", "false", "no")
 FACE_SOURCE = os.getenv("FACE_SOURCE", "ai").strip().lower()
 # how closely the AI face's eyes, brows, nose and mouth must look like hers (0..1) to be used
 FACE_MATCH_MIN = float(os.getenv("FACE_MATCH_MIN", "0.55"))
