@@ -51,13 +51,13 @@ BLEND_PASS = os.getenv("BLEND_PASS", "off").lower() not in ("0", "off", "false",
 # the blend pass only runs when the AI's body/clothes matched hers less than this (0..1); it runs at this quality
 BLEND_BELOW = float(os.getenv("BLEND_BELOW", "0.75"))
 BLEND_QUALITY = os.getenv("BLEND_QUALITY", "medium")
-CLOTHES_STRICT = os.getenv("CLOTHES_STRICT", "on").lower() not in ("0", "off", "false", "no")
+CLOTHES_STRICT = os.getenv("CLOTHES_STRICT", "off").lower() not in ("0", "off", "false", "no")
 KEEP_CLOTHES = os.getenv("KEEP_CLOTHES", "on").lower() not in ("0", "off", "false", "no")
 # "ai": the AI does a very light skin retouch and its face is used, but only if the identity check passed
 # (same features, same face shape); otherwise her real face goes back. "photo": always her real face.
 # on: a result that still shows added hands, a bare part of the head or bare scalp is never shown;
 # the customer is asked for a new photo instead (protects the brand)
-QUALITY_GATE = os.getenv("QUALITY_GATE", "on").lower() not in ("0", "off", "false", "no")
+QUALITY_GATE = os.getenv("QUALITY_GATE", "off").lower() not in ("0", "off", "false", "no")
 FACE_SOURCE = os.getenv("FACE_SOURCE", "ai").strip().lower()
 # how closely the AI face's eyes, brows, nose and mouth must look like hers (0..1) to be used
 FACE_MATCH_MIN = float(os.getenv("FACE_MATCH_MIN", "0.55"))
@@ -65,7 +65,7 @@ FACE_MATCH_MIN = float(os.getenv("FACE_MATCH_MIN", "0.55"))
 FALLBACK_SMOOTH = float(os.getenv("FALLBACK_SMOOTH", "0.6"))
 KEEP_FACE = os.getenv("KEEP_FACE", "on").lower() not in ("0", "off", "false", "no")
 SKIN_TONE = max(0.0, min(1.0, float(os.getenv("SKIN_TONE", "1"))))
-TRYON_ATTEMPTS = max(1, min(3, int(os.getenv("TRYON_ATTEMPTS", "3"))))
+TRYON_ATTEMPTS = max(1, min(3, int(os.getenv("TRYON_ATTEMPTS", "1"))))
 FACE_ENHANCE = min(1.0, max(0.0, float(os.getenv("FACE_ENHANCE", "0"))))  # retouch strength: 0 = off, 0.75 = default, 1 = strongest
 OUT_W, OUT_H = 1024, 1536
 MAX_UPLOAD = 15 * 1024 * 1024
