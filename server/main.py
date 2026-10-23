@@ -47,7 +47,7 @@ BLEND_MODE = os.getenv("BLEND_MODE", "pure").strip().lower()
 # on = her real face (smoothed only) is used in the result, never the AI redraw of it
 # on = a result whose clothes could not be kept is never shown (she is asked for a clearer photo)
 # on = one extra AI retouch so the wig, her body and the backdrop blend into one photo (adds one AI call)
-BLEND_PASS = os.getenv("BLEND_PASS", "on").lower() not in ("0", "off", "false", "no")
+BLEND_PASS = os.getenv("BLEND_PASS", "off").lower() not in ("0", "off", "false", "no")  # off: the AI never redraws her body
 # the blend pass only runs when the AI's body/clothes matched hers less than this (0..1); it runs at this quality
 BLEND_BELOW = float(os.getenv("BLEND_BELOW", "0.75"))
 BLEND_QUALITY = os.getenv("BLEND_QUALITY", "medium")
@@ -296,9 +296,10 @@ def check_result(crop: np.ndarray, lm: np.ndarray, out: np.ndarray, out_lm, seg_
             score += 15
             why.append("hands or arms were added that are not in image 1; show no hands or arms at all unless "
                        "they are visible in image 1")
-    if abs(scale - 1) > 0.1 or shift > 0.25:
-        score += 10
-        why.append("the head moved or changed size; keep the same framing as image 1")
+    if abs(scale - 1) > 0.06 or shift > 0.12:
+        score += 10 + abs(scale - 1) * 50
+        why.append("she was made smaller or bigger or moved; keep her exactly the same size and in the same place as "
+                   "in image 1, same framing, do not zoom out and do not show more of her body than image 1 shows")
     if seg_src is not None and seg_out is not None:
         H, W = crop.shape[:2]
         cl = (seg_src[..., CLOTHES] > 0.6) & ~cv2.dilate((old_hair(seg_src, lm) > 0.4).astype(np.uint8), np.ones((15, 15), np.uint8)).astype(bool)
@@ -579,6 +580,35 @@ async def blend_pass(comp: np.ndarray, sent: np.ndarray, lm: np.ndarray, seg_src
         return comp
 
 
+async def to_her_frame(out: np.ndarray, lm: np.ndarray, sent: np.ndarray, seg_src) -> np.ndarray:
+    try:
+        f_lm = await landmarks(out)
+        M = align(lm, f_lm) if f_lm is not None else None
+        if M is None:
+            return out
+        H, W = sent.shape[:2]
+        scale = float(np.sqrt(abs(np.linalg.det(M[:, :2]))))
+        if abs(scale - 1) < 0.01 and float(np.abs(M[:, 2]).max()) < 2:
+            return out  # already in her frame
+        Minv = cv2.invertAffineTransform(M)
+        back = cv2.warpAffine(out, Minv, (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT)
+        have = cv2.warpAffine(np.ones(out.shape[:2], np.float32), Minv, (W, H)) > 0.999
+        if not have.all():
+            # edges the AI's picture doesn't reach: her own photo there (her body), backdrop where she had none
+            fill = np.empty_like(sent)
+            fill[:] = BACKDROP_RGB
+            if seg_src is not None:
+                mine = np.clip(seg_src[..., BODY_SKIN] + seg_src[..., CLOTHES] + seg_src[..., HAIR], 0, 1)[..., None]
+                fill = (sent * mine + fill * (1 - mine)).astype(np.uint8)
+            a = cv2.GaussianBlur((~have).astype(np.float32), (0, 0), 2.0)[..., None]
+            back = np.clip(back * (1 - a) + fill * a, 0, 255).astype(np.uint8)
+        log.info("put back into her frame (the AI had scaled her by %.2f)", scale)
+        return back
+    except Exception:
+        log.exception("frame alignment skipped")
+        return out
+
+
 async def remove_added_hands(out: np.ndarray, lm: np.ndarray, seg_src, wig_rgb: np.ndarray) -> np.ndarray:
     """Find hands/arms in the result that are not in her photo and have the AI repaint just those areas
     (continuing her clothes and the backdrop). Everything outside them is left exactly as it is."""
@@ -684,8 +714,12 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
         # and the inside of her clothes are protected, and both are put back exactly afterwards).
         if BLEND_PASS and M is not None and needs_blend:
             out = await blend_pass(out, sent, lm, seg_src, wig_rgb, p, outfit)
+    # Deliver exactly what she gave: the result is put back into HER photo's frame, so her body is the same
+    # size and in the same place as in her photo, and the picture ends where her photo ends (a half photo
+    # gives a half result, the wig running off the edge). Anything the AI drew beyond her frame is dropped.
+    out = await to_her_frame(out, lm, sent, seg_src)
     # Never hands she isn't showing: if any are still in the picture, the AI repaints only those areas
-    if seg_src is not None:
+    if seg_src is not None and BLEND_PASS:  # (without the blend pass her own body already covers this)
         out = await remove_added_hands(out, lm, seg_src, wig_rgb)
     # Safety net: no floating pieces of clothing or skin left anywhere on the finished picture
     if seg_src is not None:
