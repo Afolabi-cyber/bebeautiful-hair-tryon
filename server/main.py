@@ -32,9 +32,9 @@ load_dotenv(ROOT / ".env")
 MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1.5")
 QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "medium")  # low | medium | high
 # Colour of the plain studio backdrop on every result (Be Beautiful Hair pink by default)
-BACKDROP_HEX = os.getenv("BACKDROP_COLOR", "#ed3995").strip().lstrip("#")
+BACKDROP_HEX = os.getenv("BACKDROP_COLOR", "#f8b0d5").strip().lstrip("#")  # soft light tint of brand pink #ED3995
 BACKDROP_RGB = tuple(int(BACKDROP_HEX[i:i + 2], 16) for i in (0, 2, 4))
-BACKDROP_WORDS = f"brand pink (exactly #{BACKDROP_HEX.upper()}, RGB {BACKDROP_RGB[0]}, {BACKDROP_RGB[1]}, {BACKDROP_RGB[2]})"
+BACKDROP_WORDS = f"soft light pink (exactly #{BACKDROP_HEX.upper()}, RGB {BACKDROP_RGB[0]}, {BACKDROP_RGB[1]}, {BACKDROP_RGB[2]})"
 # Background of the result: studio (clean light backdrop), white, or original (the customer's own)
 RESULT_BACKGROUND = os.getenv("RESULT_BACKGROUND", "studio").lower()
 # "ai" (default): the AI renders the whole head (face, hair, light and shadows together, lightly
@@ -53,10 +53,13 @@ BLEND_BELOW = float(os.getenv("BLEND_BELOW", "0.75"))
 BLEND_QUALITY = os.getenv("BLEND_QUALITY", "medium")
 CLOTHES_STRICT = os.getenv("CLOTHES_STRICT", "on").lower() not in ("0", "off", "false", "no")
 KEEP_CLOTHES = os.getenv("KEEP_CLOTHES", "on").lower() not in ("0", "off", "false", "no")
+# "ai": the AI does a very light skin retouch and its face is used, but only if the identity check passed
+# (same features, same face shape); otherwise her real face goes back. "photo": always her real face.
+FACE_SOURCE = os.getenv("FACE_SOURCE", "ai").strip().lower()
 KEEP_FACE = os.getenv("KEEP_FACE", "on").lower() not in ("0", "off", "false", "no")
 SKIN_TONE = max(0.0, min(1.0, float(os.getenv("SKIN_TONE", "1"))))
 TRYON_ATTEMPTS = max(1, min(3, int(os.getenv("TRYON_ATTEMPTS", "3"))))
-FACE_ENHANCE = min(1.0, max(0.0, float(os.getenv("FACE_ENHANCE", "1.0"))))  # retouch strength: 0 = off, 0.75 = default, 1 = strongest
+FACE_ENHANCE = min(1.0, max(0.0, float(os.getenv("FACE_ENHANCE", "0"))))  # retouch strength: 0 = off, 0.75 = default, 1 = strongest
 OUT_W, OUT_H = 1024, 1536
 MAX_UPLOAD = 15 * 1024 * 1024
 MAX_TRIES = int(os.getenv("MAX_TRYONS_PER_PERSON", "10"))  # cost guard per customer session
@@ -222,12 +225,20 @@ def build_prompt_pure(p: dict, retry_note: str = "", outfit: str = "") -> str:
         "head, a soft natural hairline blending into her forehead and temples, no visible lace, cap or edges. The hair "
         "covers her WHOLE head: the crown, both temples and both sides, with no bare scalp, gap or background "
         "showing anywhere around her head (with a side part, braids still lie flat over the scalp on the other side). "
-        "It covers both ears completely and falls naturally over the shoulders and down the front and back, as long as the "
+        "It covers both ears completely and falls evenly over BOTH shoulders, framing her face on both sides (some hair in front of each shoulder, even with a side part), naturally over the shoulders and down the front and back, as long as the "
         "wig is, full and dense with no thin or see-through patches, with real volume, shadows and light, casting soft shadows on the neck and shoulders where it touches "
         "them. Completely hide her own hair and anything on her head (scarf, cap, hood, headphones, bonnet) under the wig.\n\n"
-        "THE FACE: the face in image 1 is already professionally retouched. Keep it EXACTLY as it is: do not redraw, "
-        "reshape, resize, smooth, sharpen, slim, enlarge the eyes or change it in any way. The same face shape, eyes, "
-        "eyebrows, nose, lips, jaw, chin, expression, skin texture and exactly the same skin tone and complexion. Do not lighten, brighten, whiten, darken or tint her skin, and do not airbrush it: the natural skin texture stays. Keep the head exactly "
+        + ("THE FACE: give her skin a VERY LIGHT, natural retouch only: gently soften blemishes, spots and uneven "
+           "texture and reduce oily shine, keeping her real pores and skin texture (it must still look like real skin, "
+           "never airbrushed or plastic). Change nothing else: do not reshape, resize, slim or sharpen anything, do "
+           "not enlarge the eyes; the same face shape, eyes, eyebrows, nose, lips, jaw, chin and expression, and "
+           "exactly the same skin tone and complexion. Do not lighten, brighten, whiten, darken or tint her skin. "
+           if FACE_SOURCE == "ai" else
+           "THE FACE: the face in image 1 is already professionally retouched. Keep it EXACTLY as it is: do not redraw, "
+           "reshape, resize, smooth, sharpen, slim, enlarge the eyes or change it in any way. The same face shape, eyes, "
+           "eyebrows, nose, lips, jaw, chin, expression, skin texture and exactly the same skin tone and complexion. "
+           "Do not lighten, brighten, whiten, darken or tint her skin, and do not airbrush it. ")
+        + "Keep the head exactly "
         "where it is in image 1, at the same size and angle. Only the hairline at the top of the forehead and the hair "
         "around the face are new. Keep glasses only if she is wearing them; do not add glasses, earrings, jewellery or "
         "anything else she is not wearing.\n\n"
@@ -594,6 +605,8 @@ async def to_her_frame(out: np.ndarray, lm: np.ndarray, sent: np.ndarray, seg_sr
     try:
         f_lm = await landmarks(out)
         M = align(lm, f_lm) if f_lm is not None else None
+        if M is None and f_lm is not None:
+            M = align(lm, f_lm, strict=False)
         if M is None:
             return out
         H, W = sent.shape[:2]
@@ -616,6 +629,32 @@ async def to_her_frame(out: np.ndarray, lm: np.ndarray, sent: np.ndarray, seg_sr
         return back
     except Exception:
         log.exception("frame alignment skipped")
+        return out
+
+
+async def fill_head_gaps(out: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dict) -> np.ndarray:
+    try:
+        f_lm = await landmarks(out)
+        f_seg = await segment(out)
+        if f_lm is None or f_seg is None:
+            return out
+        miss, area = head_gaps(f_lm, f_seg, want_mask=True)
+        if not miss or not area.any():
+            return out
+        log.info("wig did not cover the %s: adding the wig's hair there", miss)
+        desc = p.get("description") or p["name"]
+        prompt = ("Image 2 is the wig she is wearing (" + desc + "). In the editable area beside her head, add the same "
+                  "wig hair so the wig covers her whole head like a real, properly installed wig: the same braids, "
+                  "colours and style, lying flat on the scalp from the part, covering the ear and falling down "
+                  "naturally, joined seamlessly to the hair that is already there. No bare scalp, gap or background "
+                  "around her head. Do not change her face, skin, clothes or anything outside the editable area. "
+                  "Keep the plain " + BACKDROP_WORDS + " backdrop. Photorealistic.")
+        fixed = await ai_edit(out, wig_rgb, prompt, keep=((1 - area) * 255).astype(np.uint8))
+        W = out.shape[1]
+        a = cv2.GaussianBlur(area.astype(np.float32), (0, 0), max(2.0, 0.006 * W))[..., None]
+        return np.clip(out * (1 - a) + fixed * a, 0, 255).astype(np.uint8)
+    except Exception:
+        log.exception("head gap fill skipped")
         return out
 
 
@@ -668,7 +707,8 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
     best, note, tries = None, "", 0
     for attempt in range(TRYON_ATTEMPTS):
         tries += 1
-        out = await ai_edit(sent, wig_rgb, build_prompt_pure(p, note, outfit), keep=face_keep)
+        out = await ai_edit(sent, wig_rgb, build_prompt_pure(p, note, outfit),
+                            keep=None if FACE_SOURCE == "ai" else face_keep)  # ai: the face may be retouched
         out_lm = await landmarks(out)
         seg_out = None
         if seg_src is not None:
@@ -691,9 +731,14 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
         gap = skin_tone_gap(sent, seg_src, out, seg_out)
         out = keep_skin_tone(sent, seg_src, out, seg_out, SKIN_TONE, exact=KEEP_FACE)
         log.info("skin tone kept (was off by L %.1f, colour %.1f)", *(gap or (0, 0)))
-    if KEEP_FACE:
+    # The AI's lightly retouched face is used only when it is provably still her face; otherwise hers goes back
+    face_ok = FACE_SOURCE == "ai" and out_lm is not None and "facial features changed" not in why \
+        and "moved or changed size" not in why and "made smaller or bigger" not in why
+    if KEEP_FACE and not face_ok:
         out, locked = face_lock(sent, lm, out, out_lm, bool(p.get("bangs")), enhance=0, relight=0.0)
         log.info("her own face kept: %s", locked)
+    else:
+        log.info("AI's lightly retouched face used (identity check passed)")
     # Her clothes stay her clothes, by construction: her real body and clothes from her photo, placed
     # relative to her face exactly as in her photo, under the new hair; anything the AI invented
     # outside her body becomes backdrop.
@@ -728,6 +773,8 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
     # size and in the same place as in her photo, and the picture ends where her photo ends (a half photo
     # gives a half result, the wig running off the edge). Anything the AI drew beyond her frame is dropped.
     out = await to_her_frame(out, lm, sent, seg_src)
+    # The wig must cover her whole head: if a side or the top is still bare, the AI adds the wig's hair there
+    out = await fill_head_gaps(out, lm, wig_rgb, p)
     # Never hands she isn't showing: if any are still in the picture, the AI repaints only those areas
     if seg_src is not None and BLEND_PASS:  # (without the blend pass her own body already covers this)
         out = await remove_added_hands(out, lm, seg_src, wig_rgb)
