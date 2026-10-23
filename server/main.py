@@ -24,13 +24,17 @@ import catalog_store
 import db
 from status import STATUS
 from admin import router as admin_router
-from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, keep_body, no_new_hands, tidy_body, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
+from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, added_hands, keep_body, match_backdrop, no_new_hands, tidy_body, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 
 MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1.5")
-QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "high")  # low | medium | high
+QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "medium")  # low | medium | high
+# Colour of the plain studio backdrop on every result (Be Beautiful Hair pink by default)
+BACKDROP_HEX = os.getenv("BACKDROP_COLOR", "#ed3995").strip().lstrip("#")
+BACKDROP_RGB = tuple(int(BACKDROP_HEX[i:i + 2], 16) for i in (0, 2, 4))
+BACKDROP_WORDS = f"brand pink (exactly #{BACKDROP_HEX.upper()}, RGB {BACKDROP_RGB[0]}, {BACKDROP_RGB[1]}, {BACKDROP_RGB[2]})"
 # Background of the result: studio (clean light backdrop), white, or original (the customer's own)
 RESULT_BACKGROUND = os.getenv("RESULT_BACKGROUND", "studio").lower()
 # "ai" (default): the AI renders the whole head (face, hair, light and shadows together, lightly
@@ -230,9 +234,11 @@ def build_prompt_pure(p: dict, retry_note: str = "", outfit: str = "") -> str:
         + (f"She is wearing: {outfit}. It must stay exactly that. " if outfit else "")
         + "The wig's hair may fall in front of the clothes.\n\n"
         "THE PHOTO: keep the light on her as it is in image 1 and light the new hair to match it. A plain, "
-        "seamless, softly lit light grey-white studio backdrop that fills the whole frame edge to edge, with nothing of her original room (walls, ceiling, lights, furniture) left anywhere. Exactly the "
+        "seamless, evenly lit solid " + BACKDROP_WORDS + " studio backdrop that fills the whole frame edge to edge, with nothing of her original room (walls, ceiling, lights, furniture) left anywhere. Exactly the "
         "same framing and pose as image 1 (if her hands are near her face or she leans on something, keep that). If any part of image 1 is blurred or empty at the edges, fill it only with the hair and "
-        "the backdrop. Never extend or invent her body or clothes: no shoulders, arms, sleeves or chest that are not "
+        "the backdrop. NO NEW HANDS OR ARMS: if a hand or arm is not visible in image 1 it must not appear in the "
+        "result at all (no folded arms, no hands on the chin, no hands at the bottom of the picture). "
+        "Never extend or invent her body or clothes: no shoulders, arms, sleeves or chest that are not "
         "visible in image 1, and the same neckline and collar. Sharp, clean, high quality, photorealistic."
         + (f"\n\nIMPORTANT, previous attempt failed: {retry_note}" if retry_note else "")
     )
@@ -259,7 +265,8 @@ def build_prompt_blend(p: dict, outfit: str = "") -> str:
         "down out of the picture;\n"
         "- one consistent light on her, the hair and the backdrop, keeping her real skin tone.\n"
         + (f"She is wearing: {outfit}. Her clothes must stay exactly that. " if outfit else "")
-        + "Plain, seamless, light grey-white studio backdrop. Do not add or change anything else. Photorealistic."
+        + "Plain, seamless, evenly lit solid " + BACKDROP_WORDS + " studio backdrop, the same colour everywhere. "
+        "Do not add or change anything else. Photorealistic."
     )
 
 
@@ -283,6 +290,12 @@ def check_result(crop: np.ndarray, lm: np.ndarray, out: np.ndarray, out_lm, seg_
     if shape_err > 0.022:
         score += (shape_err - 0.022) * 400 + 3
         why.append("her facial features changed; keep exactly the same eyes, nose, lips and face shape")
+    if seg_src is not None and seg_out is not None:
+        hands = added_hands(seg_src, seg_out, M)
+        if hands.any():
+            score += 15
+            why.append("hands or arms were added that are not in image 1; show no hands or arms at all unless "
+                       "they are visible in image 1")
     if abs(scale - 1) > 0.1 or shift > 0.25:
         score += 10
         why.append("the head moved or changed size; keep the same framing as image 1")
@@ -566,6 +579,33 @@ async def blend_pass(comp: np.ndarray, sent: np.ndarray, lm: np.ndarray, seg_src
         return comp
 
 
+async def remove_added_hands(out: np.ndarray, lm: np.ndarray, seg_src, wig_rgb: np.ndarray) -> np.ndarray:
+    """Find hands/arms in the result that are not in her photo and have the AI repaint just those areas
+    (continuing her clothes and the backdrop). Everything outside them is left exactly as it is."""
+    try:
+        f_lm = await landmarks(out)
+        f_seg = await segment(out)
+        Mf = align(lm, f_lm, strict=False) if f_lm is not None else None
+        if Mf is None or f_seg is None:
+            return out
+        hands = added_hands(seg_src, f_seg, Mf)
+        if not hands.any():
+            return out
+        W = out.shape[1]
+        area = cv2.dilate(hands, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(0.04 * W) | 1,) * 2))
+        log.info("removing %d px of added hands/arms", int(hands.sum()))
+        prompt = ("Remove the hands and arms in the editable area completely. In their place continue what is around "
+                  "them: her own clothes (same garment, colour and pattern) and the plain " + BACKDROP_WORDS +
+                  " backdrop. Do not add any hand, arm or object. Keep the wig hair as it is. Everything outside the "
+                  "editable area stays exactly the same. Photorealistic, seamless.")
+        fixed = await ai_edit(out, wig_rgb, prompt, keep=((1 - area) * 255).astype(np.uint8), quality=BLEND_QUALITY)
+        a = cv2.GaussianBlur(area.astype(np.float32), (0, 0), max(2.0, 0.006 * W))[..., None]
+        return np.clip(out * (1 - a) + fixed * a, 0, 255).astype(np.uint8)
+    except Exception:
+        log.exception("hand removal skipped")
+        return out
+
+
 async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dict, seg_src, added,
                    src_scale: float = 1.0) -> dict:
     """The AI makes the final picture. The server only checks it (same person, same clothes, face in
@@ -644,6 +684,9 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
         # and the inside of her clothes are protected, and both are put back exactly afterwards).
         if BLEND_PASS and M is not None and needs_blend:
             out = await blend_pass(out, sent, lm, seg_src, wig_rgb, p, outfit)
+    # Never hands she isn't showing: if any are still in the picture, the AI repaints only those areas
+    if seg_src is not None:
+        out = await remove_added_hands(out, lm, seg_src, wig_rgb)
     # Safety net: no floating pieces of clothing or skin left anywhere on the finished picture
     if seg_src is not None:
         try:
@@ -652,12 +695,14 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
                 out, pieces = tidy_body(out, seg_f)
                 if pieces:
                     log.info("tidied %d stray piece(s)", pieces)
+                # the backdrop in the exact brand colour (a soft colour shift, hair edges blend into it)
+                out = match_backdrop(out, seg_f, BACKDROP_RGB)
         except Exception:
             log.exception("tidy step skipped")
     before = crop
     if added is not None and added.any():
         a_ = cv2.GaussianBlur(added.astype(np.float32), (0, 0), 3)[..., None]
-        before = np.clip(crop * (1 - a_) + backdrop(OUT_H, OUT_W, "studio") * a_, 0, 255).astype(np.uint8)
+        before = np.clip(crop * (1 - a_) + np.full((OUT_H, OUT_W, 3), BACKDROP_RGB, np.float32) * a_, 0, 255).astype(np.uint8)
     mode = f"pure ai ({tries} attempt{'s' if tries > 1 else ''}, check score {score:.1f})"
     log.info("try-on finished: mode=%s", mode)
     return {"before": before, "after": out, "locked": True, "mode": mode}
@@ -669,7 +714,7 @@ async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
     if lm is None:
         raise HTTPException(422, "We couldn't find a face in your photo. Please retake it.")
     # Close selfies: extend the canvas so there's room for the full wig above the head and the shoulders
-    rgb, lm, valid = make_room(rgb, lm, OUT_W / OUT_H)
+    rgb, lm, valid = make_room(rgb, lm, OUT_W / OUT_H, fill=BACKDROP_RGB)
     x, y, w, h = head_crop(rgb.shape, lm, OUT_W / OUT_H)
     # INTER_AREA only for shrinking; enlarging with it duplicates pixels into visible blocks
     crop = cv2.resize(rgb[y:y + h, x:x + w], (OUT_W, OUT_H),
@@ -774,7 +819,7 @@ async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
     before = crop
     if added.any():  # the "before" picture shows the clean backdrop where the canvas was extended
         a_ = cv2.GaussianBlur(added.astype(np.float32), (0, 0), 3)[..., None]
-        before = np.clip(crop * (1 - a_) + backdrop(OUT_H, OUT_W, "studio") * a_, 0, 255).astype(np.uint8)
+        before = np.clip(crop * (1 - a_) + np.full((OUT_H, OUT_W, 3), BACKDROP_RGB, np.float32) * a_, 0, 255).astype(np.uint8)
     return {"before": before, "after": out, "locked": locked, "mode": mode}
 
 
