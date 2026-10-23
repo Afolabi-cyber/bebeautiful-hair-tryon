@@ -1140,11 +1140,11 @@ def _masked_blur(img: np.ndarray, weight: np.ndarray, sigma: float) -> np.ndarra
 
 def face_lock(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.ndarray | None,
               bangs: bool = False, enhance: float = 0.4, relight: float = 1.0,
-              ai_hair: np.ndarray | None = None) -> tuple[np.ndarray, bool]:
+              ai_hair: np.ndarray | None = None, strict: bool = True) -> tuple[np.ndarray, bool]:
     """Blend the user's original face back onto the generated image. Returns (image, locked)."""
     if out_lm is None:
         return out, False
-    M = align(src_lm, out_lm)
+    M = align(src_lm, out_lm, strict=strict)
     if M is None:  # the model moved or reshaped the head a lot; a paste would look wrong
         return out, False
     g_out = geom(out_lm)
