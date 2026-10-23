@@ -255,8 +255,8 @@ def build_prompt_blend(p: dict, outfit: str = "") -> str:
         "- where hair and hands or arms overlap, it looks physically right;\n"
         "- the outline of her body and clothes against the backdrop is clean and natural: no cut-out edges, halos, "
         "white or grey patches, holes or leftover pieces; any hole or gap in her clothes is filled with the same fabric;\n"
-        "- if her arms rest on something that is not in the picture, add a plain surface under them at the bottom "
-        "of the frame, without moving the arms and without adding hands on it;\n"
+        "- do not add any arms, hands, table or surface: at the bottom of the frame her clothes simply continue "
+        "down out of the picture;\n"
         "- one consistent light on her, the hair and the backdrop, keeping her real skin tone.\n"
         + (f"She is wearing: {outfit}. Her clothes must stay exactly that. " if outfit else "")
         + "Plain, seamless, light grey-white studio backdrop. Do not add or change anything else. Photorealistic."
@@ -553,7 +553,8 @@ async def blend_pass(comp: np.ndarray, sent: np.ndarray, lm: np.ndarray, seg_src
             log.info("blend pass: her clothes %s", how)
             # No hands she isn't showing: skin the AI added where her photo has none is taken out
             skin_w = cv2.warpAffine(np.ascontiguousarray(seg_src[..., BODY_SKIN]), M2, (W, H))
-            out2, gone = no_new_hands(out2, o_seg, skin_w)
+            inside = cv2.warpAffine(np.ones(seg_src.shape[:2], np.float32), M2, (W, H)) > 0.99
+            out2, gone = no_new_hands(out2, o_seg, skin_w, inside)
             if gone:
                 log.info("blend pass: removed %d px of hands/arms the AI added", gone)
         return out2
@@ -632,9 +633,7 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
             how += f", match {fit[2]:.2f}" if fit is not None else ""
             # Also blend when a visible amount of what the AI drew had to be taken out (that leaves hard
             # cut-out edges which only the blend pass can make natural)
-            cut = re.search(r"(\d+) invented px", how)
-            if cut and int(cut.group(1)) > 0.01 * OUT_W * OUT_H:
-                needs_blend = True
+            # (only a real re-pose triggers the blend pass; small trimmed edges are fine without it)
         else:
             out, how = restore_clothes(crop, seg_src, out, seg_out, None)
             if CLOTHES_STRICT and not (how.startswith("kept") or how.startswith("no clothes")):
