@@ -1532,9 +1532,10 @@ def added_hands(seg_src: np.ndarray, seg_out: np.ndarray, M: np.ndarray) -> np.n
     return out
 
 
-def head_gaps(lm_out: np.ndarray, seg_out: np.ndarray) -> str:
+def head_gaps(lm_out: np.ndarray, seg_out: np.ndarray, want_mask: bool = False):
     """Where the wig fails to cover her head: checks a band around the top and sides of her face (forehead
-    line up to the crown, temples, beside the ears) for hair. Returns "" or e.g. "left side"."""
+    line up to the crown, temples, beside the ears) for hair. Returns "" or e.g. "left side ...";
+    with want_mask=True returns (text, uint8 mask of the bare parts of that band, widened outward)."""
     H, W = seg_out.shape[:2]
     oval = lm_out[FACE_OVAL]
     c = oval.mean(axis=0)
@@ -1550,11 +1551,21 @@ def head_gaps(lm_out: np.ndarray, seg_out: np.ndarray) -> str:
     ring &= height > 0.35 * g.height
     side = -(xs - c[0]) * g.up[1] + (ys - c[1]) * g.up[0]  # across the face axis: picture-left < 0
     hair = seg_out[..., HAIR] > 0.4
-    bad = []
+    bad, mask = [], np.zeros((H, W), np.uint8)
     for name, sel in (("left side (as seen in the picture)", side < -0.15 * g.width),
                       ("right side (as seen in the picture)", side > 0.15 * g.width),
                       ("top", np.abs(side) <= 0.15 * g.width)):
         r = ring & sel
         if r.sum() > 200 and hair[r].mean() < 0.45:
             bad.append(name)
-    return " and ".join(bad)
+            mask |= (r & ~hair).astype(np.uint8)
+    text = " and ".join(bad)
+    if not want_mask:
+        return text
+    if mask.any():
+        # room for the braids to fall: widen outward and down the side, never into the face
+        big = np.zeros((H, W), np.uint8)
+        cv2.fillPoly(big, [np.round(c + (oval - c) * 1.7 + g.up * 0.15 * g.height).astype(np.int32)], 1)
+        grow = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(0.25 * g.width) | 1,) * 2))
+        mask = (grow & big & (inner == 0)).astype(np.uint8)
+    return text, mask
