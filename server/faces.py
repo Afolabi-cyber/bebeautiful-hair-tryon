@@ -873,7 +873,7 @@ def make_room(rgb: np.ndarray, lm: np.ndarray, aspect: float = 2 / 3, fill=(226,
     box_h = 3.4 * g.height
     box_w = box_h * aspect
     cx = float(lm[FACE_OVAL][:, 0].mean())
-    top = float(lm[FOREHEAD][1]) - 0.8 * g.height  # room above the head for the wig, not an empty band
+    top = float(lm[FOREHEAD][1]) - 1.2 * g.height
     pt = int(np.ceil(max(0.0, -top)))
     # Never extend below or far to the sides: that is where the AI would have to invent her shoulders,
     # arms and the rest of her clothes. Only room above the head and a little at the sides for the
@@ -903,7 +903,7 @@ def head_crop(shape: tuple[int, int], lm: np.ndarray, aspect: float = 2 / 3) -> 
     box_h = min(box_h, H, W / aspect)
     box_w = box_h * aspect
     cx = float(lm[FACE_OVAL][:, 0].mean())
-    top = float(lm[FOREHEAD][1]) - 0.8 * g.height  # room above the head for the wig, not an empty band
+    top = float(lm[FOREHEAD][1]) - 1.2 * g.height
     x = int(round(np.clip(cx - box_w / 2, 0, W - box_w)))
     y = int(round(np.clip(top, 0, H - box_h)))
     return x, y, int(round(box_w)), int(round(box_h))
@@ -1200,11 +1200,6 @@ def face_lock(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.n
     f = max(4, int(0.08 * fw))
     region = cv2.erode(region, np.ones((3, 3), np.uint8), iterations=max(1, f // 4))
     alpha = cv2.GaussianBlur(region, (0, 0), sigmaX=f / 2).astype(np.float32) / 255.0
-    # Fade out gently over the forehead (no straight edge where her face meets the AI's forehead/hairline)
-    ys, xs = np.mgrid[0:H, 0:W]
-    height = (xs - g_out.chin[0]) * g_out.up[0] + (ys - g_out.chin[1]) * g_out.up[1]
-    brow = float(((out_lm[BROWS] - g_out.chin) @ g_out.up).max())
-    alpha *= np.clip((brow + 0.03 * g_out.height - height) / (0.22 * g_out.height), 0, 1).astype(np.float32)
     alpha = (alpha * (1 - occluded))[..., None]
 
     blended = warped.astype(np.float32) * alpha + out.astype(np.float32) * (1 - alpha)
@@ -1655,71 +1650,6 @@ def neck_band(shape, lm: np.ndarray) -> np.ndarray:
     return ((height < 0.15 * g.height) & (height > -0.45 * g.height) & (np.abs(across) < 0.7 * g.width)).astype(np.uint8)
 
 
-def bare_scalp(lm_out: np.ndarray, seg_out: np.ndarray, want_mask: bool = False, strict: bool = True):
-    """True when skin shows on top of the head above the hairline (a wide bare part or an uncovered high
-    forehead): the strip from a normal hairline up to the crown, around the middle of the head."""
-    H, W = seg_out.shape[:2]
-    g = geom(lm_out)
-    c = lm_out[FACE_OVAL].mean(axis=0)
-    ys, xs = np.mgrid[0:H, 0:W]
-    height = (xs - g.chin[0]) * g.up[0] + (ys - g.chin[1]) * g.up[1]
-    across = -(xs - c[0]) * g.up[1] + (ys - c[1]) * g.up[0]
-    brow = float(((lm_out[BROWS] - g.chin) @ g.up).max())
-    # start just above the top of her forehead (face-mesh point 10), never on the forehead itself
-    fore = float((lm_out[FOREHEAD] - g.chin) @ g.up)
-    top = (height > fore + 0.06 * g.height) & (height < fore + 0.4 * g.height) & (np.abs(across) < 0.35 * g.width)
-    if top.sum() < 300:
-        return False
-    skin = (seg_out[..., FACE_SKIN] + seg_out[..., BODY_SKIN]) > 0.5
-    if strict:
-        bad = float(skin[top].mean()) > 0.12 or int((skin & top).sum()) > 0.02 * g.width * g.height
-    else:  # only a clearly raised hairline (a "bald" look), measured in the middle above her real forehead
-        mid = top & (np.abs(across) < 0.18 * g.width) & (height < fore + 0.25 * g.height)
-        bad = mid.sum() > 200 and float(skin[mid].mean()) > 0.35
-    if not want_mask:
-        return bad
-    # the skin above a normal hairline, across the whole top of the head (to be covered with hair)
-    crown = (height > fore + 0.04 * g.height) & (np.abs(across) < 0.6 * g.width)
-    mask = (crown & skin).astype(np.uint8) if bad else np.zeros((H, W), np.uint8)
-    mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(0.06 * g.width) | 1,) * 2))
-    return bad, mask
-
-
-def mirror_hair(out: np.ndarray, seg: np.ndarray, lm: np.ndarray, area: np.ndarray) -> np.ndarray:
-    """Cover `area` (bare skin on the head) with the hair at the mirror position across her face's centre
-    line; where the mirror side has no hair either, the nearest hair colour is used. Soft edges."""
-    H, W = out.shape[:2]
-    g = geom(lm)
-    c = lm[FACE_OVAL].mean(axis=0)
-    ux, uy = float(g.up[0]), float(g.up[1])
-    nx, ny = -uy, ux  # across the face
-    ys, xs = np.mgrid[0:H, 0:W].astype(np.float32)
-    d = (xs - c[0]) * nx + (ys - c[1]) * ny
-    mx, my = xs - 2 * d * nx, ys - 2 * d * ny
-    mirrored = cv2.remap(out, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-    m_hair = cv2.remap((seg[..., HAIR] > 0.5).astype(np.float32), mx, my, cv2.INTER_LINEAR) > 0.5
-    hair = seg[..., HAIR] > 0.5
-    fill = mirrored.astype(np.float32)
-    need = (area > 0) & ~m_hair
-    if need.any() and hair.any():
-        # no hair on the mirror side either: copy the nearest real hair beside or above the patch
-        ys_, xs_ = np.where(area > 0)
-        bh = int(ys_.max() - ys_.min() + 0.04 * g.height)
-        bw = int(xs_.max() - xs_.min() + 0.04 * g.width)
-        left = need.copy()
-        for dy, dx in ((0, bw), (0, -bw), (bh, 0), (bh, bw), (bh, -bw), (2 * bh, 0)):
-            if not left.any():
-                break
-            src = np.roll(np.roll(out, dy, axis=0), dx, axis=1).astype(np.float32)
-            ok = np.roll(np.roll(hair, dy, axis=0), dx, axis=1) & left
-            fill[ok] = src[ok]
-            left &= ~ok
-        if left.any():  # still nothing: the wig's typical hair colour
-            fill[left] = np.median(out[hair], axis=0)
-    a = cv2.GaussianBlur((area > 0).astype(np.float32), (0, 0), max(1.5, 0.004 * W))[..., None]
-    return np.clip(out * (1 - a) + fill * a, 0, 255).astype(np.uint8)
-
-
 def hair_hint(img: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, seg: np.ndarray | None = None) -> np.ndarray:
     """The photo given to the AI with everything on the top of her head above a normal hairline (her own hair,
     a headband, scarf or cap, and any forehead skin above that line) softly covered in the wig's hair colour.
@@ -1778,3 +1708,33 @@ def covered_hairline(lm: np.ndarray, seg: np.ndarray) -> str:
     if high.sum() > 200 and float(((seg[..., FACE_SKIN] + seg[..., BODY_SKIN]) > 0.5)[high].mean()) > 0.35:
         return "high forehead"
     return ""
+
+
+def bare_scalp(lm_out: np.ndarray, seg_out: np.ndarray, want_mask: bool = False, strict: bool = True):
+    """True when skin shows on top of the head above the hairline (a wide bare part or an uncovered high
+    forehead): the strip from a normal hairline up to the crown, around the middle of the head."""
+    H, W = seg_out.shape[:2]
+    g = geom(lm_out)
+    c = lm_out[FACE_OVAL].mean(axis=0)
+    ys, xs = np.mgrid[0:H, 0:W]
+    height = (xs - g.chin[0]) * g.up[0] + (ys - g.chin[1]) * g.up[1]
+    across = -(xs - c[0]) * g.up[1] + (ys - c[1]) * g.up[0]
+    brow = float(((lm_out[BROWS] - g.chin) @ g.up).max())
+    # start just above the top of her forehead (face-mesh point 10), never on the forehead itself
+    fore = float((lm_out[FOREHEAD] - g.chin) @ g.up)
+    top = (height > fore + 0.06 * g.height) & (height < fore + 0.4 * g.height) & (np.abs(across) < 0.35 * g.width)
+    if top.sum() < 300:
+        return False
+    skin = (seg_out[..., FACE_SKIN] + seg_out[..., BODY_SKIN]) > 0.5
+    if strict:
+        bad = float(skin[top].mean()) > 0.12 or int((skin & top).sum()) > 0.02 * g.width * g.height
+    else:  # only a clearly raised hairline (a "bald" look), measured in the middle above her real forehead
+        mid = top & (np.abs(across) < 0.18 * g.width) & (height < fore + 0.25 * g.height)
+        bad = mid.sum() > 200 and float(skin[mid].mean()) > 0.35
+    if not want_mask:
+        return bad
+    # the skin above a normal hairline, across the whole top of the head (to be covered with hair)
+    crown = (height > fore + 0.04 * g.height) & (np.abs(across) < 0.6 * g.width)
+    mask = (crown & skin).astype(np.uint8) if bad else np.zeros((H, W), np.uint8)
+    mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(0.06 * g.width) | 1,) * 2))
+    return bad, mask
