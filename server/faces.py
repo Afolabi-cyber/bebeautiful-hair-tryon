@@ -1436,7 +1436,8 @@ def keep_body(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np
     e = 2 * inset + 1
     keep = cv2.erode((body > 0.5).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (e, e))).astype(np.float32)
     g = 2 * max(2, inset // 2) + 1
-    block = cv2.dilate((new_hair > 0.35).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (g, g)))
+    g = max(g, int(0.012 * W) | 1)  # a generous margin: hair edges and loose strands are never cut
+    block = cv2.dilate((new_hair > 0.2).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (g, g)))
     if follow:
         there = cv2.dilate((ai_body > 0.5).astype(np.uint8), np.ones((5, 5), np.uint8)).astype(np.float32)
         keep *= there
