@@ -885,11 +885,12 @@ def make_room(rgb: np.ndarray, lm: np.ndarray, aspect: float = 2 / 3):
     valid = np.ones((H, W), np.uint8)
     if max(pt, pb, pl, pr) == 0:
         return rgb, lm, valid
-    big = cv2.copyMakeBorder(rgb, pt, pb, pl, pr, cv2.BORDER_REPLICATE)
+    # The added room is plain light backdrop (stretched edge pixels would give the AI streaks to copy)
+    big = cv2.copyMakeBorder(rgb, pt, pb, pl, pr, cv2.BORDER_CONSTANT, value=(226, 226, 226))
     valid = cv2.copyMakeBorder(valid, pt, pb, pl, pr, cv2.BORDER_CONSTANT, value=0)
-    soft = cv2.GaussianBlur(big, (0, 0), max(8.0, 0.04 * max(big.shape[:2])))
     m = cv2.GaussianBlur((1 - valid).astype(np.float32), (0, 0), 6)[..., None]
-    big = np.clip(big * (1 - m) + soft * m, 0, 255).astype(np.uint8)
+    plain = np.full_like(big, 226)
+    big = np.clip(big * (1 - m) + plain * m, 0, 255).astype(np.uint8)
     return big, lm + np.float32([pl, pt]), valid
 
 
@@ -1343,7 +1344,9 @@ def keep_body(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np
     body (a new shirt, extra shoulders) becomes backdrop. Returns (image, note for the log)."""
     H, W = out.shape[:2]
     warp = lambda x, f=cv2.INTER_LINEAR, b=cv2.BORDER_CONSTANT: cv2.warpAffine(x, M, (W, H), flags=f, borderMode=b)
-    src_w = warp(src, b=cv2.BORDER_REPLICATE).astype(np.float32)
+    src_w = warp(src, b=cv2.BORDER_REFLECT).astype(np.float32)
+    inside = cv2.erode((warp(np.ones(src.shape[:2], np.float32)) > 0.99).astype(np.uint8),
+                       np.ones((5, 5), np.uint8)).astype(np.float32)  # pixels that really come from her photo
     seg_w = np.stack([warp(np.ascontiguousarray(seg_src[..., i])) for i in range(seg_src.shape[-1])], -1)
     body = np.clip(seg_w[..., CLOTHES] + seg_w[..., BODY_SKIN], 0, 1)
     near = cv2.dilate((body > 0.5).astype(np.uint8), np.ones((int(0.05 * W) | 1,) * 2, np.uint8)).astype(np.float32)
@@ -1416,6 +1419,9 @@ def keep_body(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np
     if follow:
         there = cv2.dilate((ai_body > 0.5).astype(np.uint8), np.ones((5, 5), np.uint8)).astype(np.float32)
         keep *= there
+    keep = keep * inside
+    if valid is not None:  # nor from the soft room added around a close selfie
+        keep *= cv2.erode((warp(valid.astype(np.float32)) > 0.99).astype(np.uint8), np.ones((5, 5), np.uint8))
     keep = cv2.GaussianBlur(keep * (1 - block), (0, 0), max(1.0, inset / 2.5))[..., None]
     res = src_w * keep + res * (1 - keep)
     return _to_u8(res), f"kept ({float(keep.mean()) * 100:.0f}% of picture, {int(invented.sum())} invented px removed)"
@@ -1468,8 +1474,17 @@ def no_new_hands(out: np.ndarray, seg_out: np.ndarray, src_skin_w: np.ndarray) -
             keep[lab_ == i] = 1
     if not keep.any():
         return out, 0
-    m = cv2.dilate(keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
-    res = cv2.inpaint(out, m * 255, max(5, int(0.01 * W)), cv2.INPAINT_TELEA)
-    a = cv2.GaussianBlur(m.astype(np.float32), (0, 0), 2.0)[..., None]
-    res = out.astype(np.float32) * (1 - a) + res.astype(np.float32) * a
+    # removed smoothly (inpainting smears streaks across the picture)
+    m = cv2.dilate(keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+    # fill from what surrounds it (her top, or the backdrop), never from hair: a smooth patch, no streaks
+    ok = ((m == 0) & (seg_out[..., HAIR] < 0.35)).astype(np.float32)
+    plate = out.astype(np.float32)
+    for sig in (0.02 * W, 0.05 * W, 0.12 * W):
+        num = cv2.GaussianBlur(out.astype(np.float32) * ok[..., None], (0, 0), max(3.0, sig))
+        den = cv2.GaussianBlur(ok, (0, 0), max(3.0, sig))[..., None]
+        fill = num / np.maximum(den, 1e-3)
+        plate = np.where((den > 0.15) & (m[..., None] > 0) & (plate == out), fill, plate)
+    a = cv2.GaussianBlur(m.astype(np.float32), (0, 0), 3.0)
+    a = (a * (1 - np.clip((seg_out[..., HAIR] - 0.2) / 0.3, 0, 1)))[..., None]
+    res = out.astype(np.float32) * (1 - a) + plate * a
     return _to_u8(res), int(keep.sum())
