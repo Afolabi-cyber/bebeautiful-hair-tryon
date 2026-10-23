@@ -1,1011 +1,1780 @@
-"""Hair Try-On API: selfie + chosen wig -> OpenAI image edit -> new hair placed on the ORIGINAL photo."""
+"""Face landmarks, edit masks and the face lock that pastes the user's real face back.
+
+Everything works on RGB uint8 numpy arrays and (N, 2) float landmark arrays in pixels.
+"""
 from __future__ import annotations
 
-import asyncio
-import base64
-import io
-import logging
-import re
 import os
-import time
-from collections import OrderedDict, defaultdict, deque
-from pathlib import Path
+import urllib.request
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
-from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-from openai import APIStatusError, AsyncOpenAI
-from PIL import Image, ImageOps
 
-import catalog_store
-import db
-from status import STATUS
-from admin import router as admin_router
-from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, added_hands, bare_scalp, covered_hairline, hair_hint, mirror_hair, face_match, head_gaps, neck_band, keep_body, match_backdrop, no_new_hands, tidy_body, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
+MODELS_DIR = os.getenv("MODELS_DIR") or os.path.join(os.path.dirname(__file__), "models")
+MODEL_PATH = os.path.join(MODELS_DIR, "face_landmarker.task")
+SEG_URL = (
+    "https://storage.googleapis.com/mediapipe-models/image_segmenter/"
+    "selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite"
+)
+SEG_PATH = os.path.join(MODELS_DIR, "selfie_multiclass_256x256.tflite")
+# Classes of the multiclass selfie segmenter
+BG, HAIR, BODY_SKIN, FACE_SKIN, CLOTHES, OTHERS = range(6)
 
-ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(ROOT / ".env")
-
-MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1.5")
-QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "medium")  # low | medium | high
-# Colour of the plain studio backdrop on every result (Be Beautiful Hair pink by default)
-BACKDROP_HEX = os.getenv("BACKDROP_COLOR", "#f8b0d5").strip().lstrip("#")  # soft light tint of brand pink #ED3995
-BACKDROP_RGB = tuple(int(BACKDROP_HEX[i:i + 2], 16) for i in (0, 2, 4))
-BACKDROP_WORDS = f"soft light pink (exactly #{BACKDROP_HEX.upper()}, RGB {BACKDROP_RGB[0]}, {BACKDROP_RGB[1]}, {BACKDROP_RGB[2]})"
-# Background of the result: studio (clean light backdrop), white, or original (the customer's own)
-RESULT_BACKGROUND = os.getenv("RESULT_BACKGROUND", "studio").lower()
-# "ai" (default): the AI renders the whole head (face, hair, light and shadows together, lightly
-# beautified); the face is then locked back to the customer's exact shape and features and her clothes
-# always come from her photo. "photo": her original face and photo with only the AI hair laid on top.
-BLEND_MODE = os.getenv("BLEND_MODE", "pure").strip().lower()
-# "pure" (default): the AI makes the final picture; the server only prepares the photo and checks the
-# result (same person, same clothes), regenerating if a check fails. Nothing is pasted back in.
-# 1 = the result keeps her exact skin tone, 0 = whatever the AI drew
-# on = her real face (smoothed only) is used in the result, never the AI redraw of it
-# on = a result whose clothes could not be kept is never shown (she is asked for a clearer photo)
-# on = one extra AI retouch so the wig, her body and the backdrop blend into one photo (adds one AI call)
-BLEND_PASS = os.getenv("BLEND_PASS", "off").lower() not in ("0", "off", "false", "no")  # off: the AI never redraws her body
-# the blend pass only runs when the AI's body/clothes matched hers less than this (0..1); it runs at this quality
-BLEND_BELOW = float(os.getenv("BLEND_BELOW", "0.75"))
-BLEND_QUALITY = os.getenv("BLEND_QUALITY", "medium")
-CLOTHES_STRICT = os.getenv("CLOTHES_STRICT", "off").lower() not in ("0", "off", "false", "no")
-KEEP_CLOTHES = os.getenv("KEEP_CLOTHES", "on").lower() not in ("0", "off", "false", "no")
-# "ai": the AI does a very light skin retouch and its face is used, but only if the identity check passed
-# (same features, same face shape); otherwise her real face goes back. "photo": always her real face.
-# on: a result that still shows added hands, a bare part of the head or bare scalp is never shown;
-# the customer is asked for a new photo instead (protects the brand)
-QUALITY_GATE = os.getenv("QUALITY_GATE", "off").lower() not in ("0", "off", "false", "no")
-HAIRLINE_HINT = os.getenv("HAIRLINE_HINT", "on").lower() not in ("0", "off", "false", "no")
-FACE_SOURCE = os.getenv("FACE_SOURCE", "photo").strip().lower()  # photo = the setup that fitted well
-# how closely the AI face's eyes, brows, nose and mouth must look like hers (0..1) to be used
-FACE_MATCH_MIN = float(os.getenv("FACE_MATCH_MIN", "0.55"))
-# light smoothing of her real face when it is used instead of the AI's (FACE_ENHANCE 0)
-FALLBACK_SMOOTH = float(os.getenv("FALLBACK_SMOOTH", "0.6"))
-KEEP_FACE = os.getenv("KEEP_FACE", "on").lower() not in ("0", "off", "false", "no")
-SKIN_TONE = max(0.0, min(1.0, float(os.getenv("SKIN_TONE", "1"))))
-TRYON_ATTEMPTS = max(1, min(3, int(os.getenv("TRYON_ATTEMPTS", "2"))))
-FACE_ENHANCE = min(1.0, max(0.0, float(os.getenv("FACE_ENHANCE", "0"))))  # retouch strength: 0 = off, 0.75 = default, 1 = strongest
-OUT_W, OUT_H = 1024, 1536
-MAX_UPLOAD = 15 * 1024 * 1024
-MAX_TRIES = int(os.getenv("MAX_TRYONS_PER_PERSON", "10"))  # cost guard per customer session
-# Public-facing limits per device/IP per hour (stops abuse and runaway OpenAI costs)
-SESSIONS_PER_HOUR = int(os.getenv("PHOTOS_PER_IP_PER_HOUR", "15"))
-TRYONS_PER_HOUR = int(os.getenv("TRYONS_PER_IP_PER_HOUR", "30"))
-# Without the hair model the clothes can't be fully protected, so try-ons are paused by default.
-ALLOW_WITHOUT_HAIR_MODEL = os.getenv("ALLOW_WITHOUT_HAIR_MODEL", "off").lower() == "on"
-
-log = logging.getLogger("tryon")
-logging.basicConfig(level=logging.INFO)
-
-app = FastAPI(title="Hair Try-On")
-app.include_router(admin_router)
-db.init()
-client: AsyncOpenAI | None = None
-_faces: FaceTool | None = None
-_segmenter: Segmenter | None = None
-_seg_failed_at = 0.0  # last failed load; retried every 2 minutes
-_cache: OrderedDict[str, dict] = OrderedDict()
-_face_lock_guard = asyncio.Lock()  # MediaPipe detector is not thread safe
+# MediaPipe face mesh indices
+FACE_OVAL = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378,
+             400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21,
+             54, 103, 67, 109]
+BROWS = [70, 63, 105, 66, 107, 336, 296, 334, 293, 300]
+UPPER_LIDS = [159, 386]
+FOREHEAD, CHIN = 10, 152
+# Points that rarely move when only the hair changes: eye corners, nose, mouth, chin, brows.
+STABLE = [33, 133, 362, 263, 1, 4, 6, 168, 61, 291, 13, 14, 152, 70, 300, 105, 334, 199, 175]
+# Feature outlines the retouch must never soften: eyes, brows, lips.
+LEFT_EYE = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
+RIGHT_EYE = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
+LEFT_BROW = [70, 63, 105, 66, 107, 55, 65, 52, 53, 46]
+RIGHT_BROW = [300, 293, 334, 296, 336, 285, 295, 282, 283, 276]
+LIPS = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185]
+NOSTRILS = [98, 97, 2, 326, 327, 294, 278, 344, 440, 275, 4, 45, 220, 115, 48, 64]
 
 
-def faces() -> FaceTool:
-    global _faces
-    if _faces is None:
-        _faces = FaceTool()
-    return _faces
+def _lab(rgb: np.ndarray) -> np.ndarray:
+    """RGB (0..255, any dtype) -> Lab in float32 on OpenCV's 8-bit scale (L 0..255, a/b centred on 128),
+    computed in full precision so smooth skin gradients never get stepped into visible contour lines."""
+    lab = cv2.cvtColor(np.clip(np.asarray(rgb, np.float32) / 255.0, 0, 1), cv2.COLOR_RGB2LAB)
+    lab[..., 0] *= 255.0 / 100.0
+    lab[..., 1:] += 128.0
+    return lab
 
 
-def segmenter() -> Segmenter | None:
-    global _segmenter, _seg_failed_at
-    if _segmenter is None and time.time() - _seg_failed_at > 120:
+def _rgb(lab: np.ndarray) -> np.ndarray:
+    """Inverse of _lab: float32 RGB 0..255 (no rounding)."""
+    x = np.asarray(lab, np.float32).copy()
+    x[..., 0] *= 100.0 / 255.0
+    x[..., 1:] -= 128.0
+    return np.clip(cv2.cvtColor(x, cv2.COLOR_LAB2RGB), 0, 1) * 255.0
+
+
+def _to_u8(img: np.ndarray, seed: int = 7) -> np.ndarray:
+    """Round to 8-bit with a tiny dither, so gradients don't band."""
+    rng = np.random.default_rng(seed)
+    return np.clip(img + rng.uniform(-0.5, 0.5, img.shape).astype(np.float32), 0, 255).astype(np.uint8)
+
+
+def ensure_model(url: str = MODEL_URL, path: str = MODEL_PATH, min_bytes: int = 500_000) -> str:
+    """Download a model once. A partial or blocked download (tiny file, HTML error page) is removed
+    so it is retried next time instead of failing forever."""
+    if os.path.exists(path) and os.path.getsize(path) < min_bytes:
+        os.remove(path)
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".part"
+        urllib.request.urlretrieve(url, tmp)
+        if os.path.getsize(tmp) < min_bytes:
+            os.remove(tmp)
+            raise RuntimeError(f"download of {os.path.basename(path)} was blocked or incomplete")
+        os.replace(tmp, path)
+    return path
+
+
+def _model_bytes(url: str, path: str) -> bytes:
+    # Loading from bytes avoids MediaPipe path problems on Windows (spaces, non-ASCII user names).
+    with open(ensure_model(url, path), "rb") as f:
+        return f.read()
+
+
+class FaceTool:
+    """Thin wrapper over MediaPipe Face Landmarker (image mode, one face)."""
+
+    def __init__(self):
+        import mediapipe as mp
+        from mediapipe.tasks.python import BaseOptions, vision
+
+        self._mp = mp
+        opts = vision.FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_buffer=_model_bytes(MODEL_URL, MODEL_PATH)),
+            running_mode=vision.RunningMode.IMAGE,
+            num_faces=1,
+            output_face_blendshapes=True,
+        )
+        self._lm = vision.FaceLandmarker.create_from_options(opts)
+
+    def detect(self, rgb: np.ndarray) -> tuple[np.ndarray | None, float]:
+        """(landmarks, eyes-closed score 0..1 from the model's blink detector)."""
+        img = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
+        res = self._lm.detect(img)
+        if not res.face_landmarks:
+            return None, 0.0
+        h, w = rgb.shape[:2]
+        lm = np.array([[p.x * w, p.y * h] for p in res.face_landmarks[0]], dtype=np.float32)
+        blink = 0.0
         try:
-            _segmenter = Segmenter()
-            STATUS.update(hair="ok", hairError=None)
-            log.info("MODEL CHECK  hair/clothes model ........ OK")
-        except Exception as e:  # e.g. the model download is blocked on this network
-            _seg_failed_at = time.time()
-            STATUS.update(hair="failed", hairError=f"{type(e).__name__}: {e}")
-            log.error("MODEL CHECK  hair/clothes model ........ FAILED: %s\n"
-                      "  Try-ons are paused until it loads (clothes could change without it).\n"
-                      "  Fix: download %s\n  and save it as %s", STATUS["hairError"],
-                      __import__("faces").SEG_URL, __import__("faces").SEG_PATH)
-    return _segmenter
+            sc = {c.category_name: c.score for c in res.face_blendshapes[0]}
+            blink = min(sc.get("eyeBlinkLeft", 0.0), sc.get("eyeBlinkRight", 0.0))
+        except Exception:
+            pass
+        return lm, float(blink)
+
+    def landmarks(self, rgb: np.ndarray) -> np.ndarray | None:
+        return self.detect(rgb)[0]
 
 
-@app.on_event("startup")
-async def check_models():
-    """Load the models at startup and say clearly in the console whether they work."""
-    try:
-        await asyncio.to_thread(faces)
-        STATUS["face"] = "ok"
-        log.info("MODEL CHECK  face landmarks ............ OK")
-    except Exception as e:
-        STATUS["face"] = "failed"
-        log.error("MODEL CHECK  face landmarks ............ FAILED: %s", e)
-    await asyncio.to_thread(segmenter)
+class Segmenter:
+    """MediaPipe multiclass selfie segmenter: background, hair, body skin, face skin, clothes, others."""
+
+    def __init__(self):
+        import mediapipe as mp
+        from mediapipe.tasks.python import BaseOptions, vision
+
+        self._mp = mp
+        opts = vision.ImageSegmenterOptions(
+            base_options=BaseOptions(model_asset_buffer=_model_bytes(SEG_URL, SEG_PATH)),
+            running_mode=vision.RunningMode.IMAGE,
+            output_confidence_masks=True,
+            output_category_mask=False,
+        )
+        self._seg = vision.ImageSegmenter.create_from_options(opts)
+
+    def probs(self, rgb: np.ndarray) -> np.ndarray:
+        """(H, W, 6) float32 class probabilities at the image's own size."""
+        img = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
+        masks = self._seg.segment(img).confidence_masks
+        h, w = rgb.shape[:2]
+        return np.stack([cv2.resize(m.numpy_view().astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+                         for m in masks], -1)
 
 
-async def segment(rgb: np.ndarray) -> np.ndarray | None:
-    seg = segmenter()
-    if seg is None:
-        return None
-    async with _face_lock_guard:
-        return await asyncio.to_thread(seg.probs, rgb)
+def align(src_lm: np.ndarray, out_lm: np.ndarray | None, strict: bool = True):
+    """Similarity transform from the original photo to the generated one, or None if unreliable.
 
-
-def openai_client() -> AsyncOpenAI:
-    global client
-    if client is None:
-        if not os.getenv("OPENAI_API_KEY"):
-            raise HTTPException(500, "Server is missing OPENAI_API_KEY (see .env.example)")
-        client = AsyncOpenAI(timeout=240)
-    return client
-
-
-def catalog() -> dict:
-    return catalog_store.load()
-
-
-def product(wig_id: str) -> dict:
-    for p in catalog()["products"]:
-        if p["id"] == wig_id and p.get("active", True):
-            return p
-    raise HTTPException(404, "Unknown wig")
-
-
-def supports_fidelity(model: str) -> bool:
-    # input_fidelity="high" exists on gpt-image-1 and gpt-image-1.5 (not mini). gpt-image-2+ must omit it.
-    return model.startswith(("gpt-image-1.5", "gpt-image-1")) and "mini" not in model
-
-
-def build_prompt(p: dict) -> str:
-    desc = p.get("description") or p["name"]
-    return (
-        "Image 1 is a photo of a customer. Image 2 is a product photo of a wig on a plain background, "
-        "shown from the front with the face area empty.\n"
-        f"Wig: {desc}.\n"
-        "Edit image 1 so the customer is wearing this exact wig. Reproduce the wig from image 2 "
-        "faithfully: the same braid size and pattern, the same parting, the same curl type and where "
-        "the curls start, the same colours and ombre in the same places, the same length and volume. "
-        "Do not invent a different hairstyle and do not change the wig's colours. Seat the wig "
-        "flush and snug on the customer's head like a professionally installed wig: it hugs the scalp "
-        "and the shape of the skull at the crown and sides, with no gap, lift or space between the wig "
-        "and the head, the top of the wig lying close to the scalp (not puffed up or floating above the head), no visible cap, lace or edges, and the wig's hairline blends naturally into the "
-        "skin of their forehead and temples. Hide all of their own hair underneath it so none of it "
-        "shows at the hairline, temples, sides or neck. The hair hangs down in front of both ears and covers them, the same on the left and the right side, so neither ear shows. Let the hair fall over the shoulders and down the body as long as the wig "
-        "is, and match the camera angle of image 1. Use soft, even, flattering light on the face and hair, "
-        "like a good beauty photo, so it looks like a real professional photo.\n"
-        "Do not change the customer in any other way. Keep their face identical: same facial features, "
-        "face shape, skin tone and texture, eyes, eyebrows, nose, lips, makeup and expression. No beautifying, slimming, smoothing, lightening or retouching.\n"
-        "Keep the customer's clothing exactly as in image 1: the same garment, colour, pattern, neckline "
-        "and fit. Do not darken, recolour, replace or cover the clothes with anything except the wig's "
-        "hair where it naturally falls in front of the shoulders and chest. Keep the body, pose, "
-        "background and framing exactly as in image 1. Photorealistic."
-    )
-
-
-def build_prompt_ai(p: dict) -> str:
-    desc = p.get("description") or p["name"]
-    return (
-        "Image 1 is a photo of a customer. Image 2 is a product photo of a wig on a plain background, "
-        "shown from the front with the face area empty.\n"
-        f"Wig: {desc}.\n"
-        "Make a beautiful, natural, photorealistic portrait of the customer from image 1 wearing this exact wig. "
-        "Reproduce the wig from image 2 faithfully: the same braid size and pattern, the same parting, the same "
-        "curl type and where the curls start, the same colours and ombre in the same places, the same length, "
-        "density and volume. Do not invent a different hairstyle.\n"
-        "The wig must look like it is really on her head: installed flush and snug on the scalp with a natural, "
-        "soft hairline that blends into her forehead and temples, no visible lace, cap or edges, the top close "
-        "to the scalp, the hair falling naturally around the face and over the shoulders and covering both ears "
-        "completely, the same on the left and the right (do not draw any ears), "
-        "with the hair casting soft natural shadows where it touches the forehead, cheeks, neck and shoulders. "
-        "Hide all of her own hair, scarf or cap completely under the wig. The light on the face, hair and "
-        "clothes must match, as in one real photograph.\n"
-        "Gently beautify her face the way a professional retoucher and makeup artist would, keeping it natural: "
-        "even skin tone, smooth out blemishes, spots and dark circles, a soft healthy glow, neat brows, subtle "
-        "natural lip colour. Keep real skin texture, never plastic or painted. She must stay unmistakably the "
-        "same person: exactly the same face shape, eyes, eye shape and spacing, eyebrow shape, nose, lips, "
-        "jawline, age and expression, and exactly the same skin tone (do not lighten or darken her skin). "
-        "Do not add anything that is not in image 1: no glasses, earrings, jewellery or accessories she is not "
-        "already wearing. If she wears glasses or a necklace, keep them exactly as they are.\n"
-        "Keep her clothing exactly as in image 1: the same garment, colour, pattern, neckline and fit. Keep the "
-        "same pose, head size, position and framing as image 1. Replace the background with a plain, seamless, "
-        "softly lit light grey-white studio backdrop. Shot on a good camera, photorealistic, not an illustration."
-    )
-
-
-def build_prompt_pure(p: dict, retry_note: str = "", outfit: str = "") -> str:
-    desc = p.get("description") or p["name"]
-    return (
-        "Image 1 is a photo of a customer. Image 2 is a product photo of a wig (shown on its own, face area empty).\n"
-        f"Wig: {desc}.\n\n"
-        "Create ONE finished, photorealistic portrait of the customer from image 1 wearing this exact wig, as if "
-        "photographed in a professional studio. It must look like a real photograph, never like a collage or an edit. "
-        "Keep her pose, body and clothes as in image 1.\n\n"
-        "THE PARTING: a thin, natural centre part in the middle of the head, the hair falling evenly to both sides.\n\n"
-        "THE HAIRLINE: a natural, normal-height hairline that frames her face, as full and low at the front as a real "
-        "installed wig: never a high or receding hairline, never a large bare forehead.\n\n"
-        "THE WIG: reproduce image 2 faithfully: the same braid size and pattern, curl type and where the curls "
-        "start, the same colours and ombre in the same places, the same length, density and fullness. Do not invent a "
-        "different style. Fit it like a professionally installed wig: flush and snug on the scalp, the top close to the "
-        "head, a soft natural hairline blending into her forehead and temples, no visible lace, cap or edges. The hair "
-        "covers her WHOLE head: the crown, both temples and both sides, with no bare scalp, gap or background "
-        "showing anywhere around her head (with a side part, braids still lie flat over the scalp on the other side). "
-        "It covers both ears completely and falls evenly over BOTH shoulders, framing her face on both sides (some hair in front of each shoulder, even with a side part), naturally over the shoulders and down the front and back, as long as the "
-        "wig is, full and dense with no thin or see-through patches, with real volume, shadows and light, casting soft shadows on the neck and shoulders where it touches "
-        "them. Completely hide her own hair and anything on her head (scarf, cap, hood, headphones, bonnet) under the wig.\n\n"
-        + ("THE FACE: give her skin a VERY LIGHT, natural retouch only: gently soften blemishes, spots and uneven "
-           "texture and reduce oily shine, keeping her real pores and skin texture (it must still look like real skin, "
-           "never airbrushed or plastic). Change nothing else: do not reshape, resize, slim or sharpen anything, do "
-           "not enlarge the eyes; the same face shape, eyes, eyebrows, nose, lips, jaw, chin and expression, and "
-           "exactly the same skin tone and complexion. Do not lighten, brighten, whiten, darken or tint her skin. "
-           if FACE_SOURCE == "ai" else
-           "THE FACE: the face in image 1 is already professionally retouched. Keep it EXACTLY as it is: do not redraw, "
-           "reshape, resize, smooth, sharpen, slim, enlarge the eyes or change it in any way. The same face shape, eyes, "
-           "eyebrows, nose, lips, jaw, chin, expression, skin texture and exactly the same skin tone and complexion. "
-           "Do not lighten, brighten, whiten, darken or tint her skin, and do not airbrush it. ")
-        + "Keep the head exactly "
-        "where it is in image 1, at the same size and angle. Only the hairline at the top of the forehead and the hair "
-        "around the face are new. Keep glasses only if she is wearing them; do not add glasses, earrings, jewellery or "
-        "anything else she is not wearing.\n\n"
-        "THE CLOTHES: keep her clothing exactly as in image 1: the same garment, colour, pattern, print, neckline, collar "
-        "and fit, and keep any necklace. Never invent, replace or restyle her clothes, and never add a pattern or print. "
-        + (f"She is wearing: {outfit}. It must stay exactly that. " if outfit else "")
-        + "The wig's hair may fall in front of the clothes.\n\n"
-        "THE PHOTO: keep the light on her as it is in image 1 and light the new hair to match it. A plain, "
-        "seamless, evenly lit solid " + BACKDROP_WORDS + " studio backdrop that fills the whole frame edge to edge, with nothing of her original room (walls, ceiling, lights, furniture) left anywhere. Exactly the "
-        "same framing and pose as image 1 (if her hands are near her face or she leans on something, keep that). If any part of image 1 is blurred or empty at the edges, fill it only with the hair and "
-        "the backdrop. NO NEW HANDS OR ARMS: if a hand or arm is not visible in image 1 it must not appear in the "
-        "result at all (no folded arms, no hands on the chin, no hands at the bottom of the picture). "
-        "Never extend or invent her body or clothes: no shoulders, arms, sleeves or chest that are not "
-        "visible in image 1, and the same neckline and collar. Sharp, clean, high quality, photorealistic."
-        + (f"\n\nIMPORTANT, previous attempt failed: {retry_note}" if retry_note else "")
-    )
-
-
-def build_prompt_blend(p: dict, outfit: str = "") -> str:
-    desc = p.get("description") or p["name"]
-    return (
-        "Image 1 is a try-on photo of a customer wearing a new wig. It was put together from parts (her real photo "
-        "and the new hair), so the parts may not sit together naturally yet. Image 2 is the wig on its own for "
-        f"reference. Wig: {desc}.\n\n"
-        "Retouch image 1 into ONE seamless, natural photograph. Keep everything exactly where and as it is: her face, "
-        "the wig (same style, braids, curls, colours, length and position), her clothes (the same garment, colour, "
-        "pattern and fabric), her jewellery, her pose, arms and hands. Only fix how the parts meet:\n"
-        "- the wig sits naturally on her head and falls naturally over her shoulders, arms and clothes, with soft, "
-        "natural strand edges and soft contact shadows where hair touches her and her clothes;\n"
-        "- her hands and arms stay exactly where and how they are in image 1 (same position, same fingers, same "
-        "gesture): do not move, add, remove or re-pose any hand or arm. Never draw a hand that is not visible in "
-        "image 1, and never draw the same hands twice; hands hidden behind the hair stay hidden;\n"
-        "- where hair and hands or arms overlap, it looks physically right;\n"
-        "- the outline of her body and clothes against the backdrop is clean and natural: no cut-out edges, halos, "
-        "white or grey patches, holes or leftover pieces; any hole or gap in her clothes is filled with the same fabric;\n"
-        "- do not add any arms, hands, table or surface: at the bottom of the frame her clothes simply continue "
-        "down out of the picture;\n"
-        "- one consistent light on her, the hair and the backdrop, keeping her real skin tone.\n"
-        + (f"She is wearing: {outfit}. Her clothes must stay exactly that. " if outfit else "")
-        + "Plain, seamless, evenly lit solid " + BACKDROP_WORDS + " studio backdrop, the same colour everywhere. "
-        "Do not add or change anything else. Photorealistic."
-    )
-
-
-def is_long(p: dict) -> bool:
-    """Shoulder-length or longer (the hair must fall on both shoulders); short styles are not held to that."""
-    t = f"{p.get('name', '')} {p.get('description', '')}".lower()
-    return not any(w in t for w in ("bob", "pixie", "short", "chin length", "chin-length", "tapered", "afro puff"))
-
-
-def check_result(crop: np.ndarray, lm: np.ndarray, out: np.ndarray, out_lm, seg_src, seg_out,
-                 long_hair: bool = True) -> tuple[float, str]:
-    """How good an AI result is (0 = perfect, higher = worse) and what went wrong, for a retry.
-    Checks only; the picture itself is never edited."""
+    strict=False accepts a looser fit (used to position the new hair, where a few pixels don't matter).
+    """
     if out_lm is None:
-        return 99.0, "the face was not clearly visible; show her face clearly, looking at the camera"
-    M = align(lm, out_lm, strict=False)
+        return None
+    M, _ = cv2.estimateAffinePartial2D(src_lm[STABLE], out_lm[STABLE], method=cv2.LMEDS)
     if M is None:
-        return 50.0, "the face moved, changed size or changed shape; keep her face exactly as in image 1"
-    g = geom(lm)
-    mapped = lm @ M[:, :2].T + M[:, 2]
-    # identity geometry: how far her eyes, brows, nose, lips and face outline moved relative to each other
-    ids = np.unique(np.concatenate([LEFT_EYE, RIGHT_EYE, LEFT_BROW, RIGHT_BROW, LIPS, NOSTRILS, FACE_OVAL]))
-    shape_err = float(np.percentile(np.linalg.norm(mapped[ids] - out_lm[ids], axis=1), 75)) / g.height
+        return None
     scale = float(np.sqrt(abs(np.linalg.det(M[:, :2]))))
-    shift = float(np.linalg.norm(M[:, 2] + lm.mean(0) @ M[:, :2].T - lm.mean(0))) / g.height
-    score, why = 0.0, []
-    # calibrated on real faces: same person (retouched, relit) <= 0.016, a different person >= 0.049
-    if shape_err > 0.022:
-        score += (shape_err - 0.022) * 400 + 3
-        why.append("her facial features changed; keep exactly the same eyes, nose, lips and face shape")
-    if seg_out is not None:
-        # the wig must cover her whole head: hair all around the top and both sides of the face
-        if bare_scalp(lm @ M[:, :2].T + M[:, 2], seg_out, strict=False):  # hairline far too high: one retry
-            score += 12
-            why.append("bare scalp or forehead skin shows on top of her head (a wide part or an uncovered hairline); "
-                       "use a thin natural part and cover the whole top of the head down to a normal hairline")
-        miss = head_gaps(lm @ M[:, :2].T + M[:, 2], seg_out, shoulders=long_hair)
-        if miss:
-            score += 12
-            why.append(f"the wig does not cover the {miss} of her head (bare scalp or background shows there); the wig "
-                       "must cover her whole head and both sides of the face like a real installed wig, even with a "
-                       "side part: braids lie flat over the scalp on both sides and cover both ears")
-    if seg_src is not None and seg_out is not None:
-        hands = added_hands(seg_src, seg_out, M)
-        if hands.any():
-            score += 15
-            why.append("hands or arms were added that are not in image 1; show no hands or arms at all unless "
-                       "they are visible in image 1")
-    if abs(scale - 1) > 0.06 or shift > 0.12:
-        score += 10 + abs(scale - 1) * 50
-        why.append("she was made smaller or bigger or moved; keep her exactly the same size and in the same place as "
-                   "in image 1, same framing, do not zoom out and do not show more of her body than image 1 shows")
-    if seg_src is not None and seg_out is not None:
-        H, W = crop.shape[:2]
-        cl = (seg_src[..., CLOTHES] > 0.6) & ~cv2.dilate((old_hair(seg_src, lm) > 0.4).astype(np.uint8), np.ones((15, 15), np.uint8)).astype(bool)
-        Minv = cv2.invertAffineTransform(M)
-        out_s = cv2.warpAffine(out, Minv, (W, H), borderMode=cv2.BORDER_REPLICATE)
-        hair_o = cv2.warpAffine(np.ascontiguousarray(seg_out[..., HAIR]), Minv, (W, H)) > 0.3
-        cl &= ~cv2.dilate(hair_o.astype(np.uint8), np.ones((9, 9), np.uint8)).astype(bool)
-        # (with KEEP_CLOTHES her real clothes go on the result anyway, so no retry is spent on them)
-        if cl.sum() > 2000 and not KEEP_CLOTHES:
-            la = cv2.cvtColor(crop, cv2.COLOR_RGB2LAB).astype(np.float32)
-            lb = cv2.cvtColor(out_s, cv2.COLOR_RGB2LAB).astype(np.float32)
-            # colour of the garment (broad): allow the lighting to change a little, not the colour
-            dab = float(np.linalg.norm(la[cl][:, 1:].mean(0) - lb[cl][:, 1:].mean(0)))
-            dL = abs(float(la[cl][:, 0].mean() - lb[cl][:, 0].mean()))
-            # pattern: a plain garment must not come back printed (camouflage, florals), nor the reverse
-            # one-sided and with a wide margin, so light, shadows and stray strands never count
-            dtex = float(lb[cl][:, 0].std() - la[cl][:, 0].std()) + 0.5 * float(
-                lb[cl][:, 1:].std(0).mean() - la[cl][:, 1:].std(0).mean())
-            if dtex > 14:
-                score += (dtex - 14) * 0.5 + 6
-                why.append("her clothes were changed or a pattern was added; keep exactly the same garment, "
-                           "colour and pattern as in image 1")
-            if dab > 9 or dL > 30:
-                score += max(dab - 9, 0) + max(dL - 30, 0) * 0.5 + 5
-                why.append("her clothes changed colour; keep her clothing exactly as in image 1")
-        # the strict clothes guardrail: her garment must still be there, in the same shape and place
-        fit = garment_fit(crop, seg_src, out, seg_out, M)
-        if fit is not None and fit[2] < 0.5 and not KEEP_CLOTHES:
-            score += 20 + (0.5 - fit[2]) * 40
-            why.append("her clothes, pose or body were changed; this is an edit of image 1: keep her exact clothes, "
-                       "pose, arms and hands and change only the hair and the background")
-        gap = skin_tone_gap(crop, seg_src, out, seg_out)
-        if gap is not None and SKIN_TONE <= 0:  # otherwise her tone is put back afterwards anyway
-            dL, dc = gap
-            # lightness only: the colour of her photo is often off (office or bulb light), not her skin
-            if abs(dL) > 7:
-                score += (abs(dL) - 7) * 0.5 + 2
-                how = "lighter" if dL > 0 else "darker"
-                why.append(f"her skin was made {how}; keep exactly her own skin tone from image 1, "
-                           "do not lighten, brighten or airbrush her skin")
-    return score, "; ".join(why)
+    mapped = src_lm[STABLE] @ M[:, :2].T + M[:, 2]
+    err = float(np.median(np.linalg.norm(mapped - out_lm[STABLE], axis=1)))
+    limit = 0.04 if strict else 0.15
+    if not (0.5 < scale < 2.0) or err > limit * geom(out_lm).height:
+        return None
+    return M
 
 
-def to_rgb(data: bytes) -> np.ndarray:
-    try:
-        img = Image.open(io.BytesIO(data))
-    except Exception:
-        raise HTTPException(400, "That file is not an image we can read")
-    img = ImageOps.exif_transpose(img)
-    if img.mode in ("RGBA", "LA", "P"):
-        img = img.convert("RGBA")
-        bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
-        img = Image.alpha_composite(bg, img)
-    return np.array(img.convert("RGB"))
+def _wig_pixels(wig_rgb: np.ndarray) -> np.ndarray:
+    """uint8 mask of the wig in its product photo (plain background read from the border)."""
+    lab = cv2.cvtColor(wig_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    border = np.concatenate([lab[:8].reshape(-1, 3), lab[-8:].reshape(-1, 3), lab[:, :8].reshape(-1, 3), lab[:, -8:].reshape(-1, 3)])
+    m = (np.linalg.norm(lab - np.median(border, axis=0), axis=-1) > 22).astype(np.uint8)
+    return cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
 
 
-def encode(rgb: np.ndarray, fmt: str = ".png", quality: int = 92) -> bytes:
-    params = [cv2.IMWRITE_JPEG_QUALITY, quality] if fmt == ".jpg" else []
-    ok, buf = cv2.imencode(fmt, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), params)
+def wig_shape(wig_rgb: np.ndarray) -> dict | None:
+    """Outline of the wig plus where a face sits in it: crown top, face-opening width and centre."""
+    m = _wig_pixels(wig_rgb)
+    ys, xs = np.nonzero(m)
+    if len(ys) < 1000:
+        return None
+    top, h = int(ys.min()), int(ys.max() - ys.min())
+    gaps = []
+    for y in range(int(top + 0.08 * h), int(top + 0.25 * h)):
+        row = m[y]
+        on = np.nonzero(row)[0]
+        if len(on) < 2:
+            continue
+        d = np.diff(np.concatenate([[1], row, [1]]).astype(int))
+        runs = [(a, b) for a, b in zip(np.nonzero(d == -1)[0], np.nonzero(d == 1)[0]) if a > on.min() and b < on.max()]
+        if runs:
+            a, b = max(runs, key=lambda t: t[1] - t[0])
+            gaps.append((b - a, (a + b) / 2))
+    if not gaps:  # no visible face opening: fall back to the wig's centre and a third of its width
+        return {"mask": m, "top": top, "gap_w": float(np.ptp(xs)) / 3, "gap_cx": float(xs.mean())}
+    return {"mask": m, "top": top, "gap_w": float(np.median([g[0] for g in gaps])),
+            "gap_cx": float(np.median([g[1] for g in gaps]))}
+
+
+def hair_zone(src_shape, src_lm: np.ndarray, shape: dict | None, bangs: bool = False) -> np.ndarray:
+    """The only area the AI may change: the wig's product outline placed on the customer's head,
+    plus a margin and the whole top of the head, minus the face. uint8 0/1, image frame.
+
+    Everything outside it (centre of the chest, background, the rest of the clothes, the face) is
+    always copied from the customer's original photo.
+    """
+    H, W = src_shape[:2]
+    g = geom(src_lm)
+    zone = np.zeros((H, W), np.uint8)
+    if shape is not None:
+        s = g.width / shape["gap_w"]
+        cx = float(src_lm[FACE_OVAL][:, 0].mean())
+        crown_y = float(src_lm[FOREHEAD][1]) - 0.45 * g.height
+        M = np.float32([[s, 0, cx - s * shape["gap_cx"]], [0, s, crown_y - s * shape["top"]]])
+        zone = cv2.warpAffine(shape["mask"], M, (W, H), flags=cv2.INTER_NEAREST)
+        # Close small holes inside each curtain of hair, then add a margin for imperfect placement.
+        zone = cv2.morphologyEx(zone, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)))
+        grow = max(3, int(0.14 * g.width))
+        zone = cv2.dilate(zone, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1)))
+    else:  # unknown outline: sides of the head down to the shoulders
+        cv2.ellipse(zone, tuple(np.round(src_lm[FOREHEAD]).astype(int)), (int(1.3 * g.width), int(1.6 * g.height)), 0, 0, 360, 1, -1)
+    # The whole top of the head and the hairline are always editable.
+    zone[head_area(src_shape, src_lm) > 0.5] = 1
+    zone[keep_mask(src_shape, src_lm, bangs) > 0] = 0
+    zone[above_skull(src_shape, src_lm) > 0.5] = 0  # the wig hugs the head: no hair floating above it
+    return zone
+
+
+def head_area(src_shape, src_lm: np.ndarray) -> np.ndarray:
+    """float 0/1 ellipse over the top of the head: crown, hairline, temples and ears."""
+    H, W = src_shape[:2]
+    g = geom(src_lm)
+    m = np.zeros((H, W), np.float32)
+    cv2.ellipse(m, tuple(np.round(src_lm[FOREHEAD] + g.up * 0.1 * g.height).astype(int)),
+                (int(1.05 * g.width), int(0.85 * g.height)), 0, 0, 360, 1.0, -1)
+    return m
+
+
+def above_skull(src_shape, src_lm: np.ndarray, margin: float = 0.1) -> np.ndarray:
+    """float 0/1: the space ABOVE the head, outside the skull plus a wig's thickness (margin, in face
+    heights). Hair is never allowed there, so the wig hugs the head instead of floating over it."""
+    H, W = src_shape[:2]
+    g = geom(src_lm)
+    top = src_lm[FOREHEAD]
+    skull = np.zeros((H, W), np.uint8)
+    c = top - g.up * 0.02 * g.height
+    ang = float(np.degrees(np.arctan2(-g.up[0], g.up[1])))  # tilt of the face axis
+    cv2.ellipse(skull, tuple(np.round(c).astype(int)),
+                (int((0.56 + 2.5 * margin) * g.width), int((0.52 + margin) * g.height)), ang, 0, 360, 1, -1)
+    ys, xs = np.mgrid[0:H, 0:W]
+    rel = (xs - top[0]) * g.up[0] + (ys - top[1]) * g.up[1]   # height above the top of the forehead
+    above = (rel > 0.12 * g.height).astype(np.float32)
+    return cv2.GaussianBlur(above * (1 - skull.astype(np.float32)), (0, 0), max(1.5, 0.004 * W))
+
+
+def old_hair(seg_src: np.ndarray, src_lm: np.ndarray) -> np.ndarray:
+    """float 0..1: the customer's own hair, plus anything worn ON the head (head wrap, bonnet, cap,
+    an old wig's cap), which the hair model calls 'other'. Lower accessories (glasses, earrings,
+    necklaces) are not included."""
+    H, W = seg_src.shape[:2]
+    g = geom(src_lm)
+    top = src_lm[FOREHEAD]
+    ys, xs = np.mgrid[0:H, 0:W]
+    rel = (xs - top[0]) * g.up[0] + (ys - top[1]) * g.up[1]
+    crown = (rel > -0.12 * g.height).astype(np.float32) * head_area(seg_src.shape, src_lm)
+    crown[keep_mask(seg_src.shape, src_lm) > 0] = 0
+    crown = cv2.GaussianBlur(crown, (0, 0), max(1.5, 0.006 * W))
+    return np.maximum(seg_src[..., HAIR], seg_src[..., OTHERS] * crown)
+
+
+def skin_lock(seg_src: np.ndarray, src_lm: np.ndarray, bangs: bool = False) -> np.ndarray:
+    """uint8 0/1: the customer's real forehead and temple skin (and the face). The AI may not redraw it,
+    so it must build the wig around her actual head: the wig's hairline meets her own hairline and the
+    head keeps its real size and shape (no 'pasted face' seam). For fringe styles only the face below
+    the eyes is locked, so the fringe can fall over the forehead."""
+    H, W = seg_src.shape[:2]
+    m = keep_mask(seg_src.shape, src_lm, bangs) > 0
+    if not bangs:
+        skin = (seg_src[..., FACE_SKIN] > 0.5).astype(np.uint8)
+        skin = cv2.erode(skin, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * max(2, int(0.012 * W)) + 1,) * 2))
+        m |= (skin > 0) & (head_area(seg_src.shape, src_lm) > 0.5)
+    return m.astype(np.uint8)
+
+
+def photo_problem(shape, lm: np.ndarray, blink: float = 0.0) -> str | None:
+    """A friendly reason to retake the photo, or None if it's usable."""
+    H, W = shape[:2]
+    g = geom(lm)
+    eye_l, eye_r = lm[LEFT_EYE].mean(0), lm[RIGHT_EYE].mean(0)
+    v = eye_r - eye_l
+    roll = abs(float(np.degrees(np.arctan2(v[1], v[0]))))
+    roll = min(roll, 180 - roll)
+    if roll > 22:
+        return "Your head is tilted. Hold the phone upright, sit or stand straight and look at the camera."
+    mid = (lm[234] + lm[454]) / 2
+    if abs(float(np.dot(lm[1] - mid, v / max(np.linalg.norm(v), 1e-6)))) > 0.22 * g.width:
+        return "Please face the camera straight on."
+    def ear(top, bot, a, b):
+        return float(np.linalg.norm(lm[top] - lm[bot]) / max(np.linalg.norm(lm[a] - lm[b]), 1e-6))
+    if blink > 0.55 or (ear(159, 145, 33, 133) + ear(386, 374, 362, 263)) / 2 < 0.13:
+        return "Your eyes look closed. Please keep your eyes open and look at the camera."
+    # The wig needs room: the whole head with space above it, and the neck and shoulders below.
+    # Tight photos are extended automatically (make_room); only extreme close-ups are refused.
+    if g.height > 0.55 * H:
+        return "You're too close. Hold the phone at arm's length so your whole head, neck and shoulders are in the photo."
+    if g.height < 0.1 * H:
+        return "You're a bit far away. Move the phone a little closer."
+    if float(lm[FOREHEAD][1]) < 0.02 * H or float(g.chin[1]) > 0.98 * H:
+        return "Part of your face is cut off. Hold the phone a little further away so your whole head is in the photo."
+    return None
+
+
+def ear_area(src_shape, src_lm: np.ndarray) -> np.ndarray:
+    """float 0/1: where the two ears sit, just outside the sides of the face."""
+    H, W = src_shape[:2]
+    g = geom(src_lm)
+    side = src_lm[454] - src_lm[234]
+    side = side / max(float(np.linalg.norm(side)), 1e-6)
+    ang = float(np.degrees(np.arctan2(side[1], side[0])))
+    m = np.zeros((H, W), np.float32)
+    for idx, sgn in ((234, -1), (454, 1)):
+        c = src_lm[idx] + sgn * side * 0.06 * g.width - g.up * 0.03 * g.height
+        cv2.ellipse(m, tuple(np.round(c).astype(int)), (int(0.11 * g.width), int(0.19 * g.height)), ang, 0, 360, 1.0, -1)
+    return m
+
+
+def transfer_hair(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.ndarray | None,
+                  zone: np.ndarray, seg_src: np.ndarray | None = None, seg_out: np.ndarray | None = None,
+                  enhance: float = 0.75, background: str = "studio", src_scale: float = 1.0) -> np.ndarray:
+    """Final image = the customer's ORIGINAL photo, with the AI image used only inside `zone`
+    (see hair_zone). If segmentation is available, only the actual new hair inside the zone is used,
+    so clothes under and between the braids are the customer's too. Returns an image in src's frame.
+    """
+    H, W = src.shape[:2]
+    M = align(src_lm, out_lm, strict=False)
+    if M is None:  # assume the AI kept the framing
+        M = np.float32([[out.shape[1] / W, 0, 0], [0, out.shape[0] / H, 0]])
+    Minv = cv2.invertAffineTransform(M)
+    to_src = lambda x: cv2.warpAffine(x, Minv, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    out_s = to_src(out).astype(np.float32)
+    # The customer's photo is often enlarged to fill the frame (soft), while the AI draws crisp detail.
+    # Soften the AI picture to the photo's real sharpness so hair and face look like ONE photo.
+    if src_scale < 0.95:
+        sig = float(np.clip(0.5 * np.sqrt(max(1 / src_scale ** 2 - 1, 0)), 0, 1.8))
+        if sig > 0.25:
+            out_s = cv2.GaussianBlur(out_s, (0, 0), sig)
+    body_skin = None
+    if seg_src is not None:
+        body_skin = cv2.GaussianBlur(np.clip((seg_src[..., BODY_SKIN] - 0.3) / 0.4, 0, 1), (0, 0), max(2.0, 0.01 * W))
+    base = beautify(src, src_lm, enhance, skin_extra=body_skin) if enhance > 0 else src.copy()
+    z = cv2.GaussianBlur(zone.astype(np.float32), (0, 0), max(1.5, 0.004 * W))  # soft fence edge
+
+    if seg_out is None:
+        final = base.astype(np.float32) * (1 - z[..., None]) + out_s * z[..., None]
+        return np.clip(final, 0, 255).astype(np.uint8)
+
+    p = np.clip(to_src(np.ascontiguousarray(seg_out[..., HAIR])), 0, 1)
+
+    # Alpha for the new hair: firm inside, soft but not too wide at the edges (avoids dark halos
+    # from the AI's background showing round the curls).
+    a = np.clip((p - 0.35) / 0.4, 0, 1)
+    a = a * a * (3 - 2 * a)
+
+    # Gaps between braids/curls: pixels inside the hair area that look like the AI's surroundings
+    # (its repainted clothes or background) rather than like the hair get the real photo instead.
+    sig = max(2.0, 0.03 * W)
+    def wmean(img, w):
+        return cv2.GaussianBlur(img * w[..., None], (0, 0), sig) / np.maximum(cv2.GaussianBlur(w, (0, 0), sig), 1e-4)[..., None]
+    lab = cv2.cvtColor(np.clip(out_s, 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+    around = wmean(lab, (a < 0.1).astype(np.float32))
+    hairc = wmean(lab, (a > 0.9).astype(np.float32))
+    d_bg = np.linalg.norm(lab - around, axis=-1)
+    d_hair = np.linalg.norm(lab - hairc, axis=-1)
+    on_clothes = (seg_src[..., CLOTHES] + seg_src[..., OTHERS] > 0.5) if seg_src is not None else np.zeros((H, W), bool)
+    # only over the customer's real clothes, and only when the pixel is clearly fabric and clearly not hair
+    gaps = (a > 0) & on_clothes & (d_bg < 15) & (d_hair > 30) & (d_bg < 0.4 * d_hair)
+    gaps = cv2.morphologyEx(gaps.astype(np.uint8), cv2.MORPH_OPEN, np.ones((2, 2), np.uint8)).astype(bool)
+    a[gaps] = 0
+    # With the hair model the fence can be generous (the model already tells hair from clothes);
+    # it only stops stray AI hair far away from the head.
+    wide = cv2.dilate(zone, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(0.04 * W) + 1,) * 2))
+    a = cv2.GaussianBlur(a, (0, 0), 0.7) * cv2.GaussianBlur(wide.astype(np.float32), (0, 0), 3)
+
+    # Their old hair that the wig doesn't cover (e.g. an afro sticking out at the sides) is filled
+    # in from the surrounding background so it doesn't show next to the wig.
+    # (all old hair is cleared, also under the wig, so the fill borrows from background, not hair)
+    # The customer's ears: skin-coloured pixels in the ear areas. The hair model sometimes calls an ear
+    # "hair" (next to short dark hair), so without this the ear would be cleared away with the old hair.
+    face_in = keep_mask(src.shape, src_lm) > 0
+    lab_src = cv2.cvtColor(base, cv2.COLOR_RGB2LAB).astype(np.float32)
+    skin_ref = lab_src[face_in].mean(axis=0) if face_in.any() else lab_src.reshape(-1, 3).mean(axis=0)
+    skin_like = np.clip((40 - np.linalg.norm(lab_src - skin_ref, axis=-1)) / 15, 0, 1)
+    bg_src = seg_src[..., BG] if seg_src is not None else np.zeros((H, W), np.float32)
+    ears = ear_area(src.shape, src_lm) * skin_like * np.clip((0.7 - bg_src) / 0.4, 0, 1)
+    ears = cv2.GaussianBlur(cv2.morphologyEx(ears, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)), (0, 0), 1.0)
+
+    oh = old_hair(seg_src, src_lm) if seg_src is not None else np.zeros((H, W), np.float32)
+    old = (oh > 0.4).astype(np.uint8) * 255
+    old[_poly_mask(src.shape, src_lm[FACE_OVAL]) > 0.5] = 0  # never touch the face
+    old[ears > 0.3] = 0                                      # or the ears
+    if old.any():
+        old = cv2.dilate(old, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * max(2, int(0.008 * W)) + 1,) * 2))
+        base = cv2.inpaint(base, old, max(3, int(0.012 * W)), cv2.INPAINT_TELEA)
+
+    # Flush fit: on the head itself (crown, hairline, temples, round the ears) the AI's picture is
+    # used wherever the customer's old hair was or the AI drew hair, so the wig sits on the scalp the
+    # way the AI seated it, with no strip of old hair, smudge or backdrop between wig and head.
+    # Where the AI shows background there, the studio backdrop goes in (it is not "person").
+    # The face below the brows stays the customer's own (keep_mask).
+    head = head_area(src.shape, src_lm)
+    head[keep_mask(src.shape, src_lm) > 0] = 0
+    head = cv2.GaussianBlur(head, (0, 0), max(1.5, 0.006 * W))
+    hair_src = np.clip((oh - 0.25) / 0.4, 0, 1)
+    hair_src = cv2.dilate(hair_src, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * max(2, int(0.01 * W)) + 1,) * 2))
+    not_bg_out = 1 - np.clip(to_src(np.ascontiguousarray(seg_out[..., BG])), 0, 1)
+    # Old hair anywhere else (long hair or a wig she already wears, lying over the shoulders and chest)
+    # is replaced by what the AI put there: the new wig, or her top/neck continued where the old hair
+    # used to hide them (those pixels never existed in her photo). Without this they'd become holes.
+    flush = np.maximum(head * np.maximum(hair_src, p), hair_src) * np.clip((not_bg_out - 0.3) / 0.4, 0, 1)
+    flush = flush * (1 - ears)  # on the ears only the AI's actual hair is used (a wig falling over them)
+    # Never AI skin over the customer's real skin (forehead, temples): that is what made the face look
+    # cut out and pasted. AI hair over her skin (a hairline, braids at the temples) is still allowed.
+    if seg_src is not None:
+        real_skin = np.clip((seg_src[..., FACE_SKIN] + seg_src[..., BODY_SKIN] - 0.3) / 0.4, 0, 1)
+        flush = flush * (1 - real_skin)
+    a = np.maximum(a, cv2.GaussianBlur(flush, (0, 0), 1.0))
+
+    # Any AI skin used at the hairline/temples is matched to the customer's own skin tone, so the
+    # top of the forehead doesn't come out greyer or lighter than the rest of the face.
+    skin_out = np.clip(to_src(np.ascontiguousarray(seg_out[..., FACE_SKIN] + seg_out[..., BODY_SKIN])), 0, 1)
+    both = face_in & (skin_out > 0.5)
+    if both.sum() > 200:
+        lab_out = _lab(out_s)
+        shift = lab_src[both].mean(axis=0) - lab_out[both].mean(axis=0)
+        fixed = _rgb(lab_out + shift)
+        out_s = out_s * (1 - skin_out[..., None]) + fixed * skin_out[..., None]
+
+    a = a * (1 - above_skull(src.shape, src_lm))  # never hair floating above the head
+
+    # Natural hair edges. Semi-transparent edge pixels of the AI hair still carry the AI's own
+    # forehead/background colour, which shows as a light halo round the hairline and curls; pull
+    # them toward the local hair colour. Then feather the hairline where it meets her skin a little,
+    # like real baby hairs, instead of a hard cut-out edge.
+    hp = (p > 0.85).astype(np.float32)
+    hsig = max(2.0, 0.012 * W)
+    hair_col = cv2.GaussianBlur(out_s * hp[..., None], (0, 0), hsig) / np.maximum(cv2.GaussianBlur(hp, (0, 0), hsig), 1e-4)[..., None]
+    has_col = np.clip(cv2.GaussianBlur(hp, (0, 0), hsig) * 8, 0, 1)
+    edge = np.clip((0.7 - p) / 0.65, 0, 1) * (p > 0.05) * has_col  # only the faint outer edge, not the strands
+    out_s = out_s + (hair_col - out_s) * (edge * 0.6)[..., None]
+    if seg_src is not None:
+        skin_near = cv2.GaussianBlur(np.clip((seg_src[..., FACE_SKIN] - 0.3) / 0.4, 0, 1), (0, 0), max(2.0, 0.01 * W))
+        a = a * (1 - skin_near) + cv2.GaussianBlur(a, (0, 0), max(1.0, 0.0025 * W)) * skin_near
+
+    final = base.astype(np.float32) * (1 - a[..., None]) + out_s * a[..., None]
+
+    if background in ("studio", "white") and seg_src is not None:
+        # Keep the person (their clothes, skin, face and accessories) plus the new hair; replace the rest.
+        # Everything that isn't background or their old hair counts as the person, so unusual garments
+        # and accessories are always kept rather than cut away.
+        person = np.clip(1 - seg_src[..., BG] - oh, 0, 1)
+        person = np.maximum(person, _poly_mask(src.shape, src_lm[FACE_OVAL]))  # the face is always kept
+        person = np.clip((person - 0.3) / 0.4, 0, 1)                          # crisper edge, no room halo
+        person = np.maximum(person, ears)                                      # and so are the ears
+        alpha = np.maximum(person, a)
+        # Small slivers of backdrop trapped between the jaw/neck and the hair look like cut-out errors:
+        # close them and fill them from the surrounding hair and skin.
+        solid = (alpha > 0.5).astype(np.uint8)
+        k = 2 * max(3, int(0.015 * W)) + 1
+        holes = (cv2.morphologyEx(solid, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))) > 0) & (solid == 0)
+        # only right next to the face, jaw and neck (natural gaps between braids stay open)
+        jaw = _poly_mask(src.shape, src_lm[FACE_OVAL])
+        g0 = geom(src_lm)
+        jaw = cv2.dilate((jaw > 0.5).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(0.18 * g0.width) + 1,) * 2))
+        holes &= jaw > 0
+        if holes.any():
+            hm = holes.astype(np.uint8) * 255
+            final = cv2.inpaint(np.clip(final, 0, 255).astype(np.uint8), hm, max(3, int(0.01 * W)), cv2.INPAINT_TELEA).astype(np.float32)
+            alpha = np.maximum(alpha, cv2.GaussianBlur(holes.astype(np.float32), (0, 0), 1.5))
+        # A real studio photo has a soft edge, not a razor-sharp cut-out
+        alpha = cv2.GaussianBlur(alpha, (0, 0), max(1.0, 0.0018 * W))
+        bd = backdrop(H, W, background)
+        # (no "light wrap": against a white backdrop it reads as a pale outline round the face)
+        final = final * alpha[..., None] + bd * (1 - alpha[..., None])
+        made = np.maximum(a, 1 - alpha)  # pixels that didn't come from the camera (AI hair, backdrop)
+    else:
+        made = a
+    # Matching camera grain: the AI hair and the backdrop are perfectly clean while the photo has
+    # sensor noise; giving everything the same fine grain makes it read as one photograph.
+    n = photo_noise(src, src_lm)
+    if n > 0.3:
+        rng = np.random.default_rng(int(src[::97, ::89].sum()) % (2 ** 32))
+        g = cv2.GaussianBlur(rng.normal(0, 1, (H, W)).astype(np.float32), (0, 0), 0.55)
+        g *= n / max(float(g.std()), 1e-6)
+        retouched = (keep_mask(src.shape, src_lm) > 0).astype(np.float32) * min(1.0, enhance) * 0.6
+        final += (g * np.maximum(made, retouched))[..., None]
+    return np.clip(final, 0, 255).astype(np.uint8)
+
+
+def clothes_keep(seg_src: np.ndarray, src_lm: np.ndarray) -> np.ndarray:
+    """float 0..1: the customer's own clothes (and accessories worn below the face, like a necklace or
+    a bag strap), not covered by her old hair. These pixels always come from her photo."""
+    H, W = seg_src.shape[:2]
+    g = geom(src_lm)
+    ys, xs = np.mgrid[0:H, 0:W]
+    below = ((xs - g.chin[0]) * g.up[0] + (ys - g.chin[1]) * g.up[1]) < 0.15 * g.height  # glasses etc. excluded
+    c = seg_src[..., CLOTHES] + seg_src[..., OTHERS] * below
+    c = np.clip((c - 0.35) / 0.35, 0, 1) * (1 - np.clip((old_hair(seg_src, src_lm) - 0.3) / 0.4, 0, 1))
+    c[_poly_mask(seg_src.shape, src_lm[FACE_OVAL]) > 0.5] = 0
+    return c
+
+
+def clean_photo(src: np.ndarray, lm: np.ndarray, src_scale: float = 1.0) -> np.ndarray:
+    """Remove camera noise and compression blotches from the face area of a noisy or enlarged selfie,
+    with an edge-preserving denoiser (eyes, brows, lips and face shape stay sharp). Clean photos are
+    left almost untouched. Without this, a dark/far-away selfie looks mottled and blotchy after retouch."""
+    n = photo_noise(src, lm)
+    up = max(0.0, 1.0 / max(src_scale, 1e-3) - 1.0)   # how much the photo was enlarged
+    h = float(np.clip(1.0 * n + 2.0 * up, 0, 7))
+    if h < 2.0:
+        return src
+    H, W = src.shape[:2]
+    g = geom(lm)
+    x0, x1 = int(max(0, lm[:, 0].min() - 0.6 * g.width)), int(min(W, lm[:, 0].max() + 0.6 * g.width))
+    y0, y1 = int(max(0, lm[:, 1].min() - 0.8 * g.height)), int(min(H, lm[:, 1].max() + 0.8 * g.height))
+    roi = np.ascontiguousarray(src[y0:y1, x0:x1])
+    den = cv2.fastNlMeansDenoisingColored(roi, None, h, h * 0.8, 7, 21).astype(np.float32)
+    w = np.ones(roi.shape[:2], np.float32)
+    e = max(4, int(0.05 * min(roi.shape[:2])))
+    w[:e] *= np.linspace(0, 1, e)[:, None]; w[-e:] *= np.linspace(1, 0, e)[:, None]
+    w[:, :e] *= np.linspace(0, 1, e)[None]; w[:, -e:] *= np.linspace(1, 0, e)[None]
+    out = src.copy()
+    out[y0:y1, x0:x1] = np.clip(roi * (1 - w[..., None]) + den * w[..., None], 0, 255).astype(np.uint8)
+    return out
+
+
+def _clone_face(src: np.ndarray, src_lm: np.ndarray, ai: np.ndarray, seg_src: np.ndarray, seg_ai: np.ndarray,
+                enhance: float, src_scale: float = 1.0) -> np.ndarray:
+    """Her own face (lightly retouched) placed into the AI picture with NO visible edge.
+
+    Her face keeps all of its own detail; only its broad light and colour are matched to the AI
+    picture, and that match is measured on skin that is skin in BOTH pictures (never on hair or
+    background, which is what bled white or dark lines into the cheeks before). The hand-over to the
+    AI picture is wide and gradual and runs through plain skin, so there is no line to see.
+    """
+    H, W = src.shape[:2]
+    g = geom(src_lm)
+    fw = g.width
+    body = None
+    if seg_src is not None:
+        body = cv2.GaussianBlur(np.clip((seg_src[..., BODY_SKIN] - 0.3) / 0.4, 0, 1), (0, 0), max(2.0, 0.01 * W))
+    clean = clean_photo(src, src_lm, src_scale)
+    face = (beautify(clean, src_lm, enhance, skin_extra=body) if enhance > 0 else clean).astype(np.float32)
+    ell = lambda r: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * max(1, int(r)) + 1,) * 2)
+
+    hair_ai = cv2.dilate((seg_ai[..., HAIR] > 0.4).astype(np.uint8), ell(0.025 * fw)) > 0
+    skin_a = (seg_ai[..., FACE_SKIN] + seg_ai[..., BODY_SKIN]) > 0.5
+    skin_s = (seg_src[..., FACE_SKIN] + seg_src[..., BODY_SKIN]) > 0.5
+    oval = _poly_mask(src.shape, src_lm[FACE_OVAL]) > 0.5
+    core = keep_mask(src.shape, src_lm, shrink=0.88) > 0          # eyes, glasses, nose, mouth: always hers
+    # Her face: the oval plus her real forehead (where she has skin in her photo AND the AI drew skin)
+    region = (oval | (skin_s & (head_area(src.shape, src_lm) > 0.5))) & skin_a & ~hair_ai
+    region |= core & ~hair_ai
+    region = cv2.morphologyEx(region.astype(np.uint8), cv2.MORPH_OPEN, ell(0.01 * fw))
+    region = cv2.erode(region, ell(0.012 * fw))
+    if region.sum() < 0.2 * g.width * g.height:
+        return ai  # face mostly hidden: leave the AI picture (the identity lock already ran)
+
+    # Broad light/colour difference, measured only where both pictures show plain skin
+    both = (skin_a & skin_s & ~hair_ai).astype(np.float32)
+    both[core] = 0  # not inside eyes/glasses/mouth, where AI and photo legitimately differ
+    sig = max(4.0, 0.07 * fw)
+    diff = ai - face
+    wb = cv2.GaussianBlur(both, (0, 0), sig)
+    local = cv2.GaussianBlur(diff * both[..., None], (0, 0), sig) / np.maximum(wb, 1e-4)[..., None]
+    glob = diff[both > 0].mean(0) if both.sum() > 100 else np.zeros(3, np.float32)
+    conf = np.clip(wb * 4, 0, 1)[..., None]
+    offset = local * conf + glob * (1 - conf)
+    offset = cv2.GaussianBlur(offset, (0, 0), sig * 0.5)
+    matched = face + offset
+
+    # Wide, gradual hand-over through skin
+    soft = cv2.GaussianBlur(region.astype(np.float32), (0, 0), max(2.0, 0.02 * fw))
+    soft = np.clip((soft - 0.05) / 0.9, 0, 1)
+    soft = soft * soft * (3 - 2 * soft)
+    soft = np.maximum(soft, cv2.GaussianBlur((core & ~hair_ai).astype(np.float32), (0, 0), 0.01 * fw))
+    # Inside her real face outline, wherever the AI shows background instead of skin (its face was a
+    # little narrower), her own face is used fully: background must never tint the face edge.
+    # (only where her photo shows skin there, and only actual AI hair, not the safety margin round it, wins)
+    bg_in_face = oval & (seg_ai[..., BG] > 0.3) & ~(seg_ai[..., HAIR] > 0.4) & skin_s
+    if bg_in_face.any():
+        # widened a little (the AI's background edge is only known to a pixel or two) but kept inside
+        # her real skin, then feathered inward so no 1-pixel dip can let the background through
+        cover = cv2.dilate(bg_in_face.astype(np.uint8), ell(0.03 * fw)).astype(bool) & oval & (skin_s | ~(seg_ai[..., BG] < 0.1))
+        cover &= ~(seg_ai[..., HAIR] > 0.4)
+        c = cv2.GaussianBlur(cover.astype(np.float32), (0, 0), 1.5)
+        c = np.clip(c * 2, 0, 1) * cover + c * ~cover  # full strength inside, soft only outwards
+        soft = np.maximum(soft, c)
+    return ai * (1 - soft[..., None]) + matched * soft[..., None]
+
+
+def _warp_field(H: int, W: int, src_pts: np.ndarray, dst_pts: np.ndarray, weight: np.ndarray, step: int = 8):
+    """Smooth displacement field (inverse-distance weighted) so that a pixel at src_pts samples the
+    picture at dst_pts. Returns float32 maps for cv2.remap, faded out where weight is 0."""
+    gy, gx = np.mgrid[0:H:step, 0:W:step].astype(np.float32)
+    pts = np.stack([gx.ravel(), gy.ravel()], 1)
+    d = dst_pts - src_pts
+    acc = np.zeros_like(pts); wsum = np.zeros(len(pts), np.float32)
+    for i in range(0, len(src_pts), 64):  # chunked to keep memory small
+        sp, dd = src_pts[i:i + 64], d[i:i + 64]
+        dist2 = ((pts[:, None, :] - sp[None]) ** 2).sum(-1) + 25.0
+        w = 1.0 / dist2 ** 1.5
+        acc += (w[..., None] * dd[None]).sum(1); wsum += w.sum(1)
+    disp = (acc / wsum[:, None]).reshape(gx.shape + (2,))
+    disp = cv2.resize(disp, (W, H), interpolation=cv2.INTER_LINEAR)
+    disp *= weight[..., None]
+    xs, ys = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32))
+    return xs + disp[..., 0], ys + disp[..., 1]
+
+
+def compose_ai(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.ndarray | None,
+               seg_src: np.ndarray, seg_out: np.ndarray, background: str = "studio",
+               src_scale: float = 1.0, detail: float = 0.6, enhance: float = 0.75,
+               added: np.ndarray | None = None) -> np.ndarray | None:
+    """Natural blend: the AI renders the whole head (face, hairline, hair, light and shadows together,
+    lightly beautified), then the face is put back into the customer's EXACT geometry and her real
+    feature detail is restored, and her clothes always come from her own photo.
+
+    Returns an image in src's frame, or None if the AI image can't be matched to the photo reliably
+    (the caller then uses the photo-based composite instead).
+    """
+    if out_lm is None:
+        return None
+    H, W = src.shape[:2]
+    M = align(src_lm, out_lm, strict=False)
+    if M is None:
+        return None
+    g = geom(src_lm)
+    fw = g.width
+    # Safety: if the AI changed the framing (zoomed/shrank the head) or the photo is very tight, the face
+    # would have to be stretched a lot to match; the caller then uses the safer photo-based blend.
+    scale = float(np.sqrt(abs(np.linalg.det(M[:, :2]))))
+    if not (0.88 < scale < 1.12) or g.height > 0.42 * H:
+        return None
+    Minv = cv2.invertAffineTransform(M)
+    to_src = lambda x, interp=cv2.INTER_LINEAR: cv2.warpAffine(x, Minv, (W, H), flags=interp, borderMode=cv2.BORDER_REPLICATE)
+    ai = to_src(out).astype(np.float32)
+    ai_lm = out_lm @ Minv[:, :2].T + Minv[:, 2]
+
+    # 1. Her exact face shape: move every facial point of the AI face back to where it is on her photo.
+    d = ai_lm - src_lm
+    if float(np.median(np.linalg.norm(d, axis=1))) > 0.05 * g.height or float(np.percentile(np.linalg.norm(d, axis=1), 90)) > 0.1 * g.height:
+        return None  # the AI changed the face shape too much to correct without visible stretching
+    lim = 0.1 * fw
+    nrm = np.linalg.norm(d, axis=1, keepdims=True)
+    d = d * np.minimum(1, lim / np.maximum(nrm, 1e-6))
+    idx = np.arange(0, len(src_lm), 3)
+    idx = np.unique(np.concatenate([idx, FACE_OVAL, LEFT_EYE, RIGHT_EYE, LIPS, LEFT_BROW, RIGHT_BROW, NOSTRILS]))
+    region = _poly_mask(src.shape, src_lm[FACE_OVAL])
+    region = cv2.dilate(region, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(0.12 * fw) + 1,) * 2))
+    region = cv2.GaussianBlur(region, (0, 0), 0.08 * fw)
+    mx, my = _warp_field(H, W, src_lm[idx], src_lm[idx] + d[idx], region)
+    ai = cv2.remap(ai, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    seg_ai = cv2.remap(to_src(np.ascontiguousarray(seg_out)), mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+    # Same sharpness as her photo (it is often enlarged)
+    if src_scale < 0.95:
+        sig = float(np.clip(0.5 * np.sqrt(max(1 / src_scale ** 2 - 1, 0)), 0, 1.8))
+        if sig > 0.25:
+            ai = cv2.GaussianBlur(ai, (0, 0), sig)
+
+    # Her real skin tone: the AI may brighten slightly for a glow, but never lighten, darken or grey her
+    # skin. Any larger drift in tone is pulled back to her own (on all skin: face, neck, ears).
+    face_core = cv2.erode((_poly_mask(src.shape, src_lm[FACE_OVAL]) > 0.5).astype(np.uint8), np.ones((15, 15), np.uint8)) > 0
+    face_core &= seg_src[..., FACE_SKIN] > 0.4
+    skin_ai = np.clip(seg_ai[..., FACE_SKIN] + seg_ai[..., BODY_SKIN], 0, 1)
+    if face_core.sum() > 300:
+        lab_s = _lab(src)
+        lab_a = _lab(ai)
+        ms, ma = lab_s[face_core].mean(0), lab_a[face_core].mean(0)
+        dL = ma[0] - ms[0]
+        fixL = -(dL - 6) if dL > 6 else (-(dL + 2) if dL < -2 else 0.0)   # allow up to +6 brighter
+        fix = np.array([fixL, ms[1] - ma[1], ms[2] - ma[2]], np.float32)
+        fix[1:] = np.where(np.abs(fix[1:]) > 2.5, fix[1:] - np.sign(fix[1:]) * 2.5, 0)  # small warmth change ok
+        if np.abs(fix).max() > 0.5:
+            w_sk = cv2.GaussianBlur(np.maximum(skin_ai, (_poly_mask(src.shape, src_lm[FACE_OVAL]) > 0.5) * 1.0), (0, 0), 0.03 * fw)
+            lab_a += fix * w_sk[..., None]
+            ai = _rgb(lab_a)
+
+    # 2. HER face, every time. The AI draws a slightly different face on every run, so the inner face
+    #    (brows down to the chin, cheek to cheek) always comes from her own photo, lightly retouched.
+    #    Poisson blending ("seamless clone") keeps all of her real facial detail but takes on the colour
+    #    and light of the AI picture at the edges, so it sits in the same light as the new hair with no seam.
+    #    Braids the AI drew falling over the cheeks stay in front.
+    ai = _clone_face(src, src_lm, ai, seg_src, seg_ai, enhance, src_scale)
+
+    # Her real eyes, brows, nose and lips: put back their fine detail (not their colour or light).
+    feats = np.zeros((H, W), np.float32)
+    for ids, grow in ((LEFT_EYE, 0.05), (RIGHT_EYE, 0.05), (LEFT_BROW, 0.03), (RIGHT_BROW, 0.03),
+                      (LIPS, 0.03), (NOSTRILS, 0.02)):
+        feats = np.maximum(feats, _poly_mask(src.shape, src_lm[ids], grow=max(1, int(grow * fw)), blur=0.02 * fw))
+    srcf = clean_photo(src, src_lm, src_scale).astype(np.float32)  # (noise-free detail)
+    ts = max(1.0, 0.006 * fw)
+    hf = (srcf - cv2.GaussianBlur(srcf, (0, 0), ts)) - (ai - cv2.GaussianBlur(ai, (0, 0), ts))
+    ai += hf * (feats * detail)[..., None]
+
+    # 3. Her clothes, always from her photo. New hair falling in front of them stays.
+    hair = np.clip((seg_ai[..., HAIR] - 0.35) / 0.4, 0, 1)
+    hair = hair * hair * (3 - 2 * hair)
+    keep = clothes_keep(seg_src, src_lm) * (1 - hair)
+    keep = cv2.GaussianBlur(cv2.erode(keep, np.ones((3, 3), np.uint8)), (0, 0), 0.8)
+    final = ai * (1 - keep[..., None]) + srcf * keep[..., None]
+    # Clothes the AI drew where she has none (e.g. it widened the shoulders) are never shown
+    ai_clothes_only = (seg_ai[..., CLOTHES] > 0.5) & (clothes_keep(seg_src, src_lm) < 0.2) & (hair < 0.3)
+    ai_clothes_only &= ~(old_hair(seg_src, src_lm) > 0.4)  # (under her old long hair the AI must fill in)
+    added = np.zeros((H, W), bool) if added is None else added.astype(bool)
+    ai_clothes_only &= ~added  # (beyond the edge of her photo the AI continues her shoulders)
+
+    # 4. Background: clean studio backdrop with a soft, natural edge and a little light wrap.
+    if background in ("studio", "white"):
+        # Only the new hair, skin and her own clothes are "person"; leftovers the AI drew (bits of a hood,
+        # room objects) go to the backdrop instead of floating round her.
+        person = np.clip(seg_ai[..., HAIR] + seg_ai[..., FACE_SKIN] + seg_ai[..., BODY_SKIN], 0, 1)
+        person = np.maximum(person, np.clip((clothes_keep(seg_src, src_lm) - 0.2) / 0.5, 0, 1))
+        # where her old long hair hid her top, the AI's continuation of the top is part of her
+        under_old = cv2.dilate((old_hair(seg_src, src_lm) > 0.4).astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+        person = np.maximum(person, (seg_ai[..., CLOTHES] + seg_ai[..., OTHERS]) * (under_old | added))
+        person = np.maximum(person, keep)
+        person = np.maximum(person, (_poly_mask(src.shape, src_lm[FACE_OVAL]) > 0.5) * np.clip(seg_src[..., FACE_SKIN] + seg_src[..., BODY_SKIN] + (1 - seg_ai[..., BG]), 0, 1))
+        person[ai_clothes_only] = 0
+        person = np.clip((person - 0.25) / 0.5, 0, 1)
+        # Thin slivers of backdrop between her face/neck and the hair show as white lines: close them
+        # and fill them from the hair and skin around them.
+        solid = (person > 0.5).astype(np.uint8)
+        kk = 2 * max(3, int(0.035 * W)) + 1
+        holes = (cv2.morphologyEx(solid, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kk, kk))) > 0) & (solid == 0)
+        near = cv2.dilate((_poly_mask(src.shape, src_lm[FACE_OVAL]) > 0.5).astype(np.uint8),
+                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(0.3 * fw) + 1,) * 2)) > 0
+        ys_, xs_ = np.mgrid[0:H, 0:W]
+        neck = ((xs_ - g.chin[0]) ** 2 / (0.7 * fw) ** 2 + (ys_ - g.chin[1] - 0.35 * g.height) ** 2 / (0.6 * g.height) ** 2) < 1
+        holes &= (near | neck)
+        if holes.any():
+            # fill only from the person around it (hair and skin), never from the white backdrop
+            fill = _masked_blur(final, (person > 0.6).astype(np.float32), max(3.0, 0.012 * W))
+            hm = cv2.GaussianBlur(holes.astype(np.float32), (0, 0), 1.5)
+            final = final * (1 - hm[..., None]) + fill * hm[..., None]
+            # the filled area overlaps its neighbours a little, so no half-transparent seam is left between
+            cover = cv2.dilate(holes.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))).astype(np.float32)
+            person = np.maximum(person, cv2.GaussianBlur(cover, (0, 0), 1.0))
+            # pixels right round the filled gap that still carry the backdrop's white (edges of strands)
+            pale = np.clip((final.mean(-1) - fill.mean(-1) - 15) / 25, 0, 1) * cv2.GaussianBlur(cover, (0, 0), 1.0)
+            final = final * (1 - pale[..., None]) + fill * pale[..., None]
+        person = cv2.GaussianBlur(person, (0, 0), max(1.0, 0.0018 * W))
+        bd = backdrop(H, W, background)
+        # (no "light wrap": against a white backdrop it reads as a pale outline round the face)
+        final = final * person[..., None] + bd * (1 - person[..., None])
+        made = (1 - keep) * 1.0
+    else:
+        final[ai_clothes_only] = srcf[ai_clothes_only]
+        made = 1 - keep
+
+    # 5. One consistent camera grain over everything the AI made
+    n = min(photo_noise(src, src_lm) * 0.5, 1.6)  # low: the face itself was cleaned
+    if n > 0.3:
+        rng = np.random.default_rng(int(src[::97, ::89].sum()) % (2 ** 32))
+        gr = cv2.GaussianBlur(rng.normal(0, 1, (H, W)).astype(np.float32), (0, 0), 0.55)
+        final += (gr * (n / max(float(gr.std()), 1e-6)) * made)[..., None]
+    return _to_u8(final)
+
+
+def photo_noise(src: np.ndarray, lm: np.ndarray) -> float:
+    """Camera noise level of the photo (std of fine grain on the cheeks), for matching grain."""
+    gray = cv2.cvtColor(src, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    hf = gray - cv2.GaussianBlur(gray, (0, 0), 1.0)
+    m = cv2.erode(keep_mask(src.shape, lm), np.ones((9, 9), np.uint8)) > 0
+    if m.sum() < 200:
+        return 0.0
+    v = hf[m]
+    return float(np.clip(1.4826 * np.median(np.abs(v - np.median(v))), 0, 4.0))
+
+
+def backdrop(H: int, W: int, kind: str = "studio") -> np.ndarray:
+    """Clean photo-studio background: soft light gradient with a gentle glow behind the head."""
+    if kind == "white":
+        return np.full((H, W, 3), 255, np.float32)
+    t = np.linspace(0, 1, H, dtype=np.float32)[:, None, None]
+    top, bottom = np.array([251, 247, 249], np.float32), np.array([236, 227, 232], np.float32)
+    bg = top * (1 - t) + bottom * t
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    glow = np.exp(-(((xx - W / 2) / (0.55 * W)) ** 2 + ((yy - 0.35 * H) / (0.45 * H)) ** 2))[..., None]
+    return np.clip(bg + glow * 6, 0, 255)
+
+
+def keep_clothes(src: np.ndarray, out: np.ndarray, M: np.ndarray | None,
+                 seg_src: np.ndarray, seg_out: np.ndarray) -> tuple[np.ndarray, float]:
+    """Put the customer's original clothes back wherever the new hair isn't covering them.
+
+    seg_src is the segmentation of `src` (original photo), seg_out of `out` (generated photo).
+    Returns (image, fraction of the image restored).
+    """
+    H, W = out.shape[:2]
+    if M is None:
+        M = np.float32([[W / src.shape[1], 0, 0], [0, H / src.shape[0], 0]])  # same framing assumed
+    warp = lambda x, interp=cv2.INTER_LINEAR: cv2.warpAffine(x, M, (W, H), flags=interp, borderMode=cv2.BORDER_REPLICATE)
+    src_w = warp(src)
+    clothes = warp(seg_src[..., CLOTHES] + seg_src[..., OTHERS])  # garments and accessories in the original
+    hair = seg_out[..., HAIR]
+    # Grow the new hair a little so wispy curl ends and their soft edges stay the AI's.
+    k = max(3, int(round(0.006 * W)) | 1)
+    hair = cv2.dilate(hair, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    clothes = np.clip(clothes, 0, 1)
+    keep = clothes * (1 - np.clip(hair, 0, 1)) * (1 - seg_out[..., FACE_SKIN])
+    keep = (keep > 0.5).astype(np.float32)
+
+    # Gaps between braids/curls lying on the clothes: the segmenter marks them as hair, so the AI's
+    # repainted fabric would show through. Where those pixels match the colour the AI gave the
+    # clothes (and differ from the real fabric), use the real fabric instead.
+    lab_o = cv2.cvtColor(out, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab_s = cv2.cvtColor(src_w, cv2.COLOR_RGB2LAB).astype(np.float32)
+    open_cloth = keep > 0.5
+    zone = (clothes > 0.5) & ~open_cloth
+    if open_cloth.sum() > 500 and zone.any():
+        fake = np.median(lab_o[open_cloth], axis=0)
+        spread = float(np.median(np.linalg.norm(lab_o[open_cloth] - fake, axis=1)))
+        if spread < 18:  # the AI's clothing is a fairly uniform colour, so the test is reliable
+            d_fake = np.linalg.norm(lab_o - fake, axis=-1)
+            near_fake = d_fake < max(14.0, 2.5 * spread)
+            changed = np.linalg.norm(lab_o - lab_s, axis=-1) > 20
+            # Never take a pixel that looks like the wig itself (dark wigs on dark repaints).
+            hair_only = (hair > 0.5) & (clothes < 0.3)
+            if hair_only.sum() > 200:
+                d_hair = np.linalg.norm(lab_o - np.median(lab_o[hair_only], axis=0), axis=-1)
+                near_fake &= d_fake < 0.5 * d_hair
+            gaps = zone & near_fake & changed
+            gaps = cv2.morphologyEx(gaps.astype(np.uint8), cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+            gap_keep = cv2.GaussianBlur(gaps.astype(np.float32), (0, 0), 0.6)  # tight edge: don't bleed into braids
+        else:
+            gap_keep = None
+    else:
+        gap_keep = None
+
+    keep = cv2.GaussianBlur(keep, (0, 0), max(1.0, 0.003 * W))
+    if gap_keep is not None:
+        keep = np.maximum(keep, gap_keep)
+    out = (src_w.astype(np.float32) * keep[..., None] + out.astype(np.float32) * (1 - keep[..., None]))
+    return np.clip(out, 0, 255).astype(np.uint8), float(keep.mean())
+
+
+@dataclass
+class FaceGeom:
+    up: np.ndarray       # unit vector pointing from chin to forehead
+    height: float        # forehead to chin distance in px
+    width: float         # cheek to cheek distance in px
+    chin: np.ndarray
+
+
+def geom(lm: np.ndarray) -> FaceGeom:
+    v = lm[FOREHEAD] - lm[CHIN]
+    h = float(np.linalg.norm(v))
+    return FaceGeom(up=v / max(h, 1e-6), height=h, width=float(np.linalg.norm(lm[234] - lm[454])), chin=lm[CHIN])
+
+
+def make_room(rgb: np.ndarray, lm: np.ndarray, aspect: float = 2 / 3, fill=(226, 226, 226)):
+    """Close selfies leave no room above the head (or below the chin) for a wig. Extend the canvas so a
+    full head-and-shoulders frame fits; the extension is a soft, blurred continuation that the AI repaints
+    (hair, top of the head, shoulders, backdrop). Returns (image, landmarks, valid) where valid is 1 on
+    real photo pixels and 0 on the added area."""
+    H, W = rgb.shape[:2]
+    g = geom(lm)
+    # Enough for the head with room above it, the hair and the shoulders; not a whole invented body.
+    box_h = 3.4 * g.height
+    box_w = box_h * aspect
+    cx = float(lm[FACE_OVAL][:, 0].mean())
+    top = float(lm[FOREHEAD][1]) - 0.8 * g.height  # room above the head for the wig, not an empty band
+    pt = int(np.ceil(max(0.0, -top)))
+    # Never extend below or far to the sides: that is where the AI would have to invent her shoulders,
+    # arms and the rest of her clothes. Only room above the head and a little at the sides for the
+    # hair; the crop then frames what she really photographed.
+    pb = 0
+    need_w = min(box_w, 2.8 * g.width)
+    pl = int(np.ceil(max(0.0, need_w / 2 - cx)))
+    pr = int(np.ceil(max(0.0, cx + need_w / 2 - W)))
+    valid = np.ones((H, W), np.uint8)
+    if max(pt, pb, pl, pr) == 0:
+        return rgb, lm, valid
+    # The added room is plain light backdrop (stretched edge pixels would give the AI streaks to copy)
+    big = cv2.copyMakeBorder(rgb, pt, pb, pl, pr, cv2.BORDER_CONSTANT, value=tuple(int(v) for v in fill))
+    valid = cv2.copyMakeBorder(valid, pt, pb, pl, pr, cv2.BORDER_CONSTANT, value=0)
+    m = cv2.GaussianBlur((1 - valid).astype(np.float32), (0, 0), 6)[..., None]
+    plain = np.empty_like(big)
+    plain[:] = fill
+    big = np.clip(big * (1 - m) + plain * m, 0, 255).astype(np.uint8)
+    return big, lm + np.float32([pl, pt]), valid
+
+
+def head_crop(shape: tuple[int, int], lm: np.ndarray, aspect: float = 2 / 3) -> tuple[int, int, int, int]:
+    """A portrait (w:h = aspect) box around the head with headroom for big styles. Returns x, y, w, h."""
+    H, W = shape[:2]
+    g = geom(lm)
+    box_h = 4.6 * g.height
+    box_h = min(box_h, H, W / aspect)
+    box_w = box_h * aspect
+    cx = float(lm[FACE_OVAL][:, 0].mean())
+    top = float(lm[FOREHEAD][1]) - 0.8 * g.height  # room above the head for the wig, not an empty band
+    x = int(round(np.clip(cx - box_w / 2, 0, W - box_w)))
+    y = int(round(np.clip(top, 0, H - box_h)))
+    return x, y, int(round(box_w)), int(round(box_h))
+
+
+def keep_mask(shape: tuple[int, int], lm: np.ndarray, bangs: bool = False, shrink: float = 0.92) -> np.ndarray:
+    """uint8 mask (255 = the user's face we must not change).
+
+    The face oval is shrunk a little so hair can frame the cheeks and temples, and everything
+    above the brows (or above the eyes for fringe styles) is released so the hairline can change.
+    """
+    H, W = shape[:2]
+    g = geom(lm)
+    oval = lm[FACE_OVAL]
+    c = oval.mean(axis=0)
+    oval = c + (oval - c) * shrink
+    m = np.zeros((H, W), np.uint8)
+    cv2.fillPoly(m, [np.round(oval).astype(np.int32)], 255)
+
+    rel = lambda pts: (pts - g.chin) @ g.up  # height of each point above the chin, along the face axis
+    if bangs:
+        cut = float(rel(lm[UPPER_LIDS]).max()) + 0.03 * g.height
+    else:
+        cut = float(rel(lm[BROWS]).max()) + 0.03 * g.height
+    ys, xs = np.mgrid[0:H, 0:W]
+    above = ((xs - g.chin[0]) * g.up[0] + (ys - g.chin[1]) * g.up[1]) > cut
+    m[above] = 0
+    return m
+
+
+def openai_mask_png(keep: np.ndarray) -> bytes:
+    """OpenAI edit mask: transparent = may edit, opaque = keep."""
+    rgba = np.zeros((*keep.shape, 4), np.uint8)
+    rgba[..., 3] = np.where(keep > 0, 255, 0)
+    ok, buf = cv2.imencode(".png", rgba)
     assert ok
     return buf.tobytes()
 
 
-def data_url(jpg: bytes) -> str:
-    return "data:image/jpeg;base64," + base64.b64encode(jpg).decode()
+def _poly_mask(shape, pts: np.ndarray, grow: int = 0, blur: float = 0) -> np.ndarray:
+    m = np.zeros(shape[:2], np.uint8)
+    cv2.fillPoly(m, [cv2.convexHull(np.round(pts).astype(np.int32))], 255)
+    if grow > 0:
+        m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1)))
+    if blur > 0:
+        m = cv2.GaussianBlur(m, (0, 0), blur)
+    return m.astype(np.float32) / 255.0
 
 
-async def landmarks(rgb: np.ndarray):
-    async with _face_lock_guard:
-        return await asyncio.to_thread(faces().landmarks, rgb)
+def beautify(rgb: np.ndarray, lm: np.ndarray, strength: float = 0.75, style: str | None = None,
+             skin_extra: np.ndarray | None = None) -> np.ndarray:
+    """Professional-style retouch that never moves or reshapes anything.
+
+    Face recognition relies on the geometry and appearance of the eyes, brows, nose, mouth and
+    face shape. All of those pixels stay where they are; the retouch only works on skin tone,
+    texture and light:
+      - smooths skin while keeping fine pore texture (frequency separation), so it doesn't look plastic
+      - evens out blotches and redness without changing the overall skin tone
+      - removes oily shine, gently lifts the face and the under-eye area
+      - sharpens eyes, brows and lips slightly and adds a touch of lip colour
+    """
+    k = float(np.clip(strength, 0, 1))
+    if k <= 0:
+        return rgb
+    H, W = rgb.shape[:2]
+    fw = float(np.linalg.norm(lm[234] - lm[454]))
+    px = lambda f: max(1, int(round(f * fw)))
+
+    face = _poly_mask(rgb.shape, lm[FACE_OVAL], blur=px(0.02))
+    feats = np.zeros((H, W), np.float32)
+    for idx, grow in ((LEFT_EYE, 0.035), (RIGHT_EYE, 0.035), (LEFT_BROW, 0.02), (RIGHT_BROW, 0.02),
+                      (LIPS, 0.02), (NOSTRILS, 0.0)):
+        feats = np.maximum(feats, _poly_mask(rgb.shape, lm[idx], grow=px(grow), blur=px(0.012)))
+    skin = face * (1 - feats)
+
+    img = rgb.astype(np.float32)
+
+    # 1. Skin smoothing by frequency separation (what professional retouchers use): blemishes and
+    #    unevenness live in the middle frequencies, so only those are softened; the broad shading and
+    #    the fine pore texture stay as they are. Blurs only average skin with skin (no halos from eyes,
+    #    brows, lips or hair). This can't flatten skin into patches or steps the way an edge-preserving
+    #    (bilateral) filter does on deep skin tones and enlarged photos.
+    w = np.clip(skin, 1e-3, 1)
+    s_hi, s_lo = max(0.8, 0.004 * fw), max(3.0, 0.025 * fw)
+    hi_blur = _masked_blur(img, w, s_hi)
+    lo_blur = _masked_blur(img, w, s_lo)
+    fine = img - hi_blur
+    mid = hi_blur - lo_blur
+    smooth = lo_blur + mid * (1 - 0.6 * k) + fine  # smoother skin; broad tone and pores unchanged
+    a = skin[..., None]
+    img = img * (1 - a) + smooth * a
+
+    lab = _lab(img)
+    L, A, B = lab[..., 0], lab[..., 1], lab[..., 2]
+
+    # 2. Even tone: pull local colour blotches toward the surrounding skin colour (overall tone unchanged).
+    wsk = np.maximum(skin, 1e-3)
+    wblur = np.maximum(cv2.GaussianBlur(wsk, (0, 0), px(0.05)), 1e-4)
+    for ch in (A, B):
+        local = cv2.GaussianBlur(ch * wsk, (0, 0), px(0.05)) / wblur
+        ch += (local - ch) * skin * 0.55 * k
+
+    inside = skin > 0.5
+    if inside.sum() > 200:
+        # 3. Shine: compress the brightest skin highlights.
+        thr = float(np.percentile(L[inside], 85))
+        L -= np.maximum(0, L - thr) * skin * 0.6 * k
+        # 4. Soft lift on the whole face, a little more under the eyes.
+        under = np.zeros((H, W), np.float32)
+        for lid, corner_a, corner_b in ((145, 33, 133), (374, 263, 362)):
+            c = lm[lid] + np.array([0, 0.055 * fw])
+            axes = (int(np.linalg.norm(lm[corner_a] - lm[corner_b]) * 0.62), px(0.05))
+            cv2.ellipse(under, tuple(np.round(c).astype(int)), axes, 0, 0, 360, 1.0, -1)
+        under = cv2.GaussianBlur(under, (0, 0), px(0.03)) * (1 - feats)
+        # natural = smoothing only: no lift, so the eyes and face keep their own light
+        if (style or "").lower() != "natural":
+            L += face * 4.0 * k + under * 6.0 * k
+
+    lab = np.stack([L, A, B], -1)
+    out = _rgb(lab)
+
+    # 5. Crisper eyes, brows and lips; a touch of lip colour.
+    # (not in natural: sharpening makes eyes look glassy, worst on small faces that were enlarged)
+    feat_k = 0.0 if (style or "").lower() == "natural" else k
+    sharp = out + (out - cv2.GaussianBlur(out, (0, 0), max(1.0, 0.006 * fw))) * 0.6 * feat_k
+    fm = (feats * face)[..., None]
+    out = out * (1 - fm) + sharp * fm
+    lips = _poly_mask(rgb.shape, lm[LIPS], blur=px(0.008))
+    lab = _lab(out)
+    lab[..., 1:] = 128 + (lab[..., 1:] - 128) * (1 + lips * 0.12 * feat_k)[..., None]
+    out = _rgb(lab)
+    if (style or os.getenv("BEAUTY_STYLE", "glam")).lower() == "glam":
+        out = glam(out, lm, k, face, skin, feats, px, skin_extra)
+    # Put the real skin texture (pores, fine detail) back on top of the evened-out tone. Without it the
+    # skin turns smooth and painted, which is the clearest sign of a filtered/AI image.
+    o = out.astype(np.float32)
+    src_f = rgb.astype(np.float32)
+    ts = max(0.8, 0.0035 * fw)
+    tex = (src_f - cv2.GaussianBlur(src_f, (0, 0), ts)) - (o - cv2.GaussianBlur(o, (0, 0), ts))
+    o += tex * (skin * 0.7)[..., None]
+    return _to_u8(o)
 
 
-@app.get("/api/health")
-def public_health():
-    """For Render's health check: up as long as the face model works."""
-    if STATUS["face"] == "failed":
-        raise HTTPException(503, "face model not loaded")
-    return {"ok": True, "hairModel": STATUS["hair"]}
+MOUTH_INNER = [78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308, 415, 310, 311, 312, 13, 82, 81, 80, 191]
+CHEEKS = [(50, 205), (280, 425)]  # (cheekbone, lower cheek) on each side
 
 
-@app.get("/api/catalog")
-def get_catalog():
-    c = catalog()
-    return {
-        "brand": c.get("brand", {}),
-        "products": [
-            {k: p.get(k) for k in ("id", "name", "price", "image", "thumb", "buyUrl")}
-            for p in c["products"] if p.get("active", True)
-        ],
-    }
+def glam(rgb: np.ndarray, lm: np.ndarray, k: float, face, skin, feats, px, skin_extra=None) -> np.ndarray:
+    """Beauty-filter look (like a Snapchat beauty lens) on top of the retouch, light and colour only:
+    nothing is moved, enlarged or slimmed, so face recognition still matches the person.
+      - extra-smooth, even, luminous skin with a soft glow
+      - brighter, clearer eyes (whites and irises), whiter teeth
+      - rosy glossy lips, a soft blush on the cheekbones, a warm healthy tone
+    """
+    H, W = rgb.shape[:2]
+    img = rgb.astype(np.float32)
+
+    # 1. A little more evening of mid-frequency unevenness (same frequency separation; texture kept).
+    w = np.clip(skin, 1e-3, 1)
+    hi_blur = _masked_blur(img, w, max(0.8, 0.004 * px(1)))
+    lo_blur = _masked_blur(img, w, max(3.0, px(0.03)))
+    img = img + (lo_blur - hi_blur) * (0.12 * k * skin)[..., None]
+
+    # 2. Luminous skin: an exposure lift (multiplying R, G and B together keeps the skin's own colour
+    #    and richness; adding brightness instead turns deep skin tones ashy and grey).
+    # the neck and other visible skin get the same lift, so the face doesn't look brighter than the neck
+    tone = face if skin_extra is None else np.maximum(face, np.clip(skin_extra, 0, 1))
+    gain = 1 + tone * 0.11 * k
+    img = 255 * (1 - (1 - np.clip(img / 255, 0, 1)) ** gain[..., None])  # lifts darker tones most, no clipping
+
+    lab = _lab(img)
+    L, A, B = lab[..., 0], lab[..., 1], lab[..., 2]
+    # richer, warmer skin colour (a healthy glow, never grey)
+    A += (A - 128) * tone * 0.1 * k + tone * 0.8 * k
+    B += (B - 128) * tone * 0.1 * k + tone * 1.8 * k
+
+    # 3. Blush on the cheekbones.
+    blush = np.zeros((H, W), np.float32)
+    for top, low in CHEEKS:
+        c = (lm[top] * 0.6 + lm[low] * 0.4)
+        cv2.ellipse(blush, tuple(np.round(c).astype(int)), (px(0.11), px(0.07)), 0, 0, 360, 1.0, -1)
+    blush = cv2.GaussianBlur(blush, (0, 0), px(0.05)) * skin
+    A += blush * 4 * k
+    L += blush * 1.0 * k
+
+    # 4. Eyes: clearer whites (less red/yellow, a bit brighter), brighter irises.
+    eyes = np.zeros((H, W), np.float32)
+    for idx in (LEFT_EYE, RIGHT_EYE):
+        eyes = np.maximum(eyes, _poly_mask(rgb.shape, lm[idx], blur=px(0.004)))
+    chroma = np.sqrt((A - 128) ** 2 + (B - 128) ** 2)
+    if (eyes > 0.5).sum() > 20:
+        lthr = float(np.percentile(L[eyes > 0.5], 55))
+        white = eyes * np.clip((L - lthr) / 20, 0, 1) * np.clip((40 - chroma) / 20, 0, 1)
+        A += (128 - A) * white * 0.5 * k
+        B += (128 - B) * white * 0.5 * k
+        L += white * 8 * k
+        iris = eyes * (1 - white)
+        L += iris * 3 * k
+
+    # 5. Teeth: whiter where the mouth is open and the pixels are bright.
+    mouth = _poly_mask(rgb.shape, lm[MOUTH_INNER], blur=px(0.004))
+    if (mouth > 0.5).sum() > 20:
+        mthr = float(np.percentile(L[mouth > 0.5], 50))
+        teeth = mouth * np.clip((L - mthr) / 15, 0, 1) * np.clip((L - 90) / 30, 0, 1)
+        B += (128 - B) * teeth * 0.6 * k
+        A += (128 - A) * teeth * 0.3 * k
+        L += teeth * 10 * k
+
+    # 6. Lips: rosier and a little glossier.
+    lips = _poly_mask(rgb.shape, lm[LIPS], blur=px(0.008)) * (1 - mouth)
+    A += lips * 3.5 * k  # a touch rosier; no added gloss (it looked artificial)
+
+    lab = np.stack([L, A, B], -1)
+    out = _rgb(lab)
+
+    # 7. Soft glow (bloom) over the face, screen-blended, never over the eye/lip detail.
+    bloom = cv2.GaussianBlur(out, (0, 0), px(0.04))
+    screen = 255 - (255 - out) * (255 - bloom) / 255
+    g = (face * (1 - feats * 0.8) * 0.06 * k)[..., None]
+    out = out * (1 - g) + screen * g
+
+    # 8. Keep eyes, brows and lashes crisp after all the softening.
+    sharp = out + (out - cv2.GaussianBlur(out, (0, 0), max(1.0, 0.005 * px(1)))) * 0.5 * k
+    fm = (feats * face)[..., None]
+    out = out * (1 - fm) + sharp * fm
+    return np.clip(out, 0, 255)
 
 
-_hits: dict[str, deque] = defaultdict(deque)
+def _masked_blur(img: np.ndarray, weight: np.ndarray, sigma: float) -> np.ndarray:
+    """Gaussian blur that only averages pixels where weight > 0 (so hair and background don't bleed in)."""
+    w = cv2.GaussianBlur(weight, (0, 0), sigma)[..., None]
+    return cv2.GaussianBlur(img * weight[..., None], (0, 0), sigma) / np.maximum(w, 1e-4)
 
 
-def rate_limit(kind: str, ip: str, limit: int, window: int = 3600):
-    q = _hits[f"{kind}:{ip}"]
-    now = time.time()
-    while q and q[0] < now - window:
-        q.popleft()
-    if len(q) >= limit:
-        raise HTTPException(429, "Lots of try-ons from this device. Please come back in a little while.")
-    q.append(now)
+def face_lock(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.ndarray | None,
+              bangs: bool = False, enhance: float = 0.4, relight: float = 1.0) -> tuple[np.ndarray, bool]:
+    """Blend the user's original face back onto the generated image. Returns (image, locked)."""
+    if out_lm is None:
+        return out, False
+    M = align(src_lm, out_lm)
+    if M is None:  # the model moved or reshaped the head a lot; a paste would look wrong
+        return out, False
+    g_out = geom(out_lm)
+
+    H, W = out.shape[:2]
+    warped = cv2.warpAffine(src, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    src_keep = cv2.warpAffine(keep_mask(src.shape, src_lm, bangs), M, (W, H), flags=cv2.INTER_LINEAR)
+    region = cv2.min(src_keep, keep_mask(out.shape, out_lm, bangs))
+
+    fw = g_out.width
+
+    # Hair the AI drew in front of the face (braids falling over the cheeks or temples) must stay.
+    # Only the outer band of the face is checked, never the eyes/nose/mouth core, and a pixel counts
+    # as hair when it differs from the customer's skin far more than the overall lighting change.
+    lab_s0 = cv2.cvtColor(warped, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab_o0 = cv2.cvtColor(out, cv2.COLOR_RGB2LAB).astype(np.float32)
+    inside0 = region > 128
+    occluded = np.zeros(region.shape, np.float32)
+    if inside0.sum() > 100:
+        d = lab_o0 - lab_s0
+        d -= np.median(d[inside0], axis=0)  # remove the global lighting/white-balance difference
+        dist = np.sqrt((d[..., 0] * 0.8) ** 2 + d[..., 1] ** 2 + d[..., 2] ** 2)
+        oval = out_lm[FACE_OVAL]
+        c = oval.mean(axis=0)
+        core = np.zeros(region.shape, np.uint8)
+        cv2.fillPoly(core, [np.round(c + (oval - c) * 0.72).astype(np.int32)], 255)
+        band = inside0 & (core == 0)
+        hair = (band & (dist > 28)).astype(np.uint8) * 255
+        hair = cv2.morphologyEx(hair, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))  # drop specks
+        occluded = cv2.GaussianBlur(cv2.dilate(hair, np.ones((5, 5), np.uint8)), (0, 0), 2).astype(np.float32) / 255.0
+
+    skin = (region > 0).astype(np.float32) * (occluded < 0.3)
+
+    # Retouch the customer's own face (skin, tone, light only; nothing moves). enhance=0 turns it off.
+    if enhance > 0:
+        lm_w = src_lm @ M[:, :2].T + M[:, 2]
+        warped = beautify(warped, lm_w, enhance)
+
+    # Relight: keep the customer's fine detail (features, texture), take the overall lighting and
+    # white balance from the new image so the face sits in the same light as the hair and background.
+    # The shift is capped, so the customer's skin tone can only move a little.
+    lab_s = cv2.cvtColor(warped, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab_o = cv2.cvtColor(out, cv2.COLOR_RGB2LAB).astype(np.float32)
+    sig = max(2.0, 0.06 * fw)
+    low_s, low_o = _masked_blur(lab_s, skin, sig), _masked_blur(lab_o, skin, sig)
+    delta = low_o - low_s
+    delta[..., 0] = np.clip(delta[..., 0], -18 * relight, 18 * relight)    # lightness
+    delta[..., 1:] = np.clip(delta[..., 1:], -14 * relight, 14 * relight)  # colour cast (camera white balance)
+    face = lab_s + delta
+
+    warped = cv2.cvtColor(np.clip(face, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+
+    # Wide, soft edge so there is no visible outline.
+    f = max(4, int(0.08 * fw))
+    region = cv2.erode(region, np.ones((3, 3), np.uint8), iterations=max(1, f // 4))
+    alpha = cv2.GaussianBlur(region, (0, 0), sigmaX=f / 2).astype(np.float32) / 255.0
+    # Fade out gently over the forehead (no straight edge where her face meets the AI's forehead/hairline)
+    ys, xs = np.mgrid[0:H, 0:W]
+    height = (xs - g_out.chin[0]) * g_out.up[0] + (ys - g_out.chin[1]) * g_out.up[1]
+    brow = float(((out_lm[BROWS] - g_out.chin) @ g_out.up).max())
+    alpha *= np.clip((brow + 0.03 * g_out.height - height) / (0.22 * g_out.height), 0, 1).astype(np.float32)
+    alpha = (alpha * (1 - occluded))[..., None]
+
+    blended = warped.astype(np.float32) * alpha + out.astype(np.float32) * (1 - alpha)
+    return np.clip(blended, 0, 255).astype(np.uint8), True
 
 
-def client_ip(req: Request) -> str:
-    fwd = req.headers.get("x-forwarded-for")
-    return fwd.split(",")[0].strip() if fwd else (req.client.host if req.client else "")
+def _skin_stats(rgb: np.ndarray, seg: np.ndarray):
+    """Mean and spread of her face skin in Lab (lips, eyes and brows are not FACE_SKIN in the model)."""
+    m = seg[..., FACE_SKIN] > 0.6
+    if m.sum() < 500:
+        return None
+    lab = _lab(rgb)[m]
+    return lab.mean(0), lab.std(0) + 1e-3
 
 
-@app.post("/api/sessions")
-async def create_session(
-    req: Request,
-    selfie: UploadFile = File(...),
-    name: str = Form(...),
-    phone: str = Form(""),
-    email: str = Form(""),
-    consent: str = Form("false"),
-):
-    """Customer details + the photo taken before any wig is applied."""
-    rate_limit("photo", client_ip(req), SESSIONS_PER_HOUR)
-    name, phone, email = name.strip()[:80], phone.strip()[:30], email.strip()[:120]
-    if len(name) < 2:
-        raise HTTPException(400, "Please enter your name")
-    if consent.lower() not in ("true", "1", "yes", "on"):
-        raise HTTPException(400, "Please accept the photo consent to continue")
-    raw = await selfie.read()
-    if len(raw) > MAX_UPLOAD:
-        raise HTTPException(413, "Photo is too large (max 15 MB)")
-
-    rgb = to_rgb(raw)
-    k = min(1.0, 1800 / max(rgb.shape[:2]))
-    if k < 1:
-        rgb = cv2.resize(rgb, None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
-    async with _face_lock_guard:
-        lm0, blink = await asyncio.to_thread(faces().detect, rgb)
-    if lm0 is None:
-        raise HTTPException(422, "We couldn't find a face. Face the camera in good light and try again.")
-    problem = photo_problem(rgb.shape, lm0, blink)
-    if problem:
-        raise HTTPException(422, problem)
-
-    photo = db.save_photo(encode(rgb, ".jpg", 94))
-    sid = db.create_session(name, phone or None, email or None, True, photo,
-                            req.headers.get("user-agent", "")[:300], client_ip(req))
-    return {"sessionId": sid}
+def skin_tone_gap(ref: np.ndarray, seg_ref: np.ndarray, out: np.ndarray, seg_out: np.ndarray):
+    """How far the result's face skin moved from hers: (lightness change, colour change), Lab units.
+    Positive lightness = the result is lighter."""
+    a, b = _skin_stats(ref, seg_ref), _skin_stats(out, seg_out)
+    if a is None or b is None:
+        return None
+    d = b[0] - a[0]
+    return float(d[0] * 100 / 255), float(np.hypot(d[1], d[2]))
 
 
-@app.post("/api/tryon")
-async def tryon(req: Request, session_id: str = Form(...), wig_id: str = Form(...)):
-    s = db.get_session(session_id)
-    if not s:
-        raise HTTPException(404, "Session expired, please take your photo again")
-    p = product(wig_id)
+def keep_skin_tone(ref: np.ndarray, seg_ref: np.ndarray, out: np.ndarray, seg_out: np.ndarray,
+                   strength: float = 1.0, exact: bool = False) -> np.ndarray:
+    """Put her own skin tone back on the result's skin (face, neck, arms) when the AI lightened, darkened
+    or tinted it. One smooth colour shift through a soft skin mask: nothing is pasted, nothing is moved,
+    the AI's light and the texture it kept stay, so there is no edge or line anywhere."""
+    a, b = _skin_stats(ref, seg_ref), _skin_stats(out, seg_out)
+    if a is None or b is None or strength <= 0:
+        return out
+    (mr, sr), (mo, so) = a, b
+    H, W = out.shape[:2]
+    skin = np.clip((seg_out[..., FACE_SKIN] + seg_out[..., BODY_SKIN] - 0.3) / 0.4, 0, 1).astype(np.float32)
+    # keep the wig and glasses untouched where they overlap skin, then feather widely
+    skin *= 1 - np.clip((seg_out[..., HAIR] + seg_out[..., OTHERS] - 0.3) / 0.4, 0, 1)
+    skin = cv2.GaussianBlur(skin, (0, 0), max(3.0, 0.012 * W)) * strength
+    lab = _lab(out)
+    # Her photo's own colour cast (blue office light, yellow bulbs) is not her skin: measure it on the
+    # neutral greys/whites of each picture (ceiling, walls, backdrop) and leave it out of the target.
+    def cast(img, seg):
+        l = _lab(img)
+        c = np.hypot(l[..., 1] - 128, l[..., 2] - 128)
+        n = (c < 14) & (l[..., 0] > 90) & (seg[..., FACE_SKIN] + seg[..., BODY_SKIN] < 0.2)
+        return (l[n][:, 1:].mean(0) - 128) if n.sum() > 800 else np.zeros(2, np.float32)
+    # exact: her skin colour as photographed (her real face goes back on top, so they must match)
+    want_ab = mr[1:] if exact else mr[1:] - (cast(ref, seg_ref) - cast(out, seg_out))
+    # lightness: her mean, a contrast close to hers (capped so shading stays natural)
+    ratio = float(np.clip(sr[0] / so[0], 0.85, 1.15))
+    L = (lab[..., 0] - mo[0]) * ratio + mr[0]
+    dL = np.clip(L - lab[..., 0], -40, 40)  # at most ~16 L* units either way
+    # colour: half way to hers, so a photo taken in odd light never turns the result ashy or orange
+    dab = np.clip(want_ab - mo[1:], -14, 14) if exact else np.clip(0.5 * (want_ab - mo[1:]), -6, 6)
+    lab[..., 0] += dL * skin
+    lab[..., 1] += dab[0] * skin
+    lab[..., 2] += dab[1] * skin
+    return _to_u8(_rgb(lab))
 
-    key = f"{session_id}:{wig_id}:{p.get('updated', '')}:{MODEL}"
-    if key in _cache:
-        _cache.move_to_end(key)
-        return _cache[key]
-    if BLEND_MODE != "pure" and segmenter() is None and not ALLOW_WITHOUT_HAIR_MODEL:
-        raise HTTPException(503, "Virtual try-on is being set up. Please try again in a few minutes.")
-    rate_limit("tryon", client_ip(req), TRYONS_PER_HOUR)
-    if db.count_tryons(session_id, "ok") >= MAX_TRIES:
-        raise HTTPException(429, f"You've reached the limit of {MAX_TRIES} try-ons. Thank you for trying!")
 
-    started = time.time()
-    try:
-        result = await run_tryon(to_rgb((db.PHOTOS / s["selfie"]).read_bytes()), p)
-    except HTTPException as e:
-        db.add_tryon(session_id=session_id, wig_id=wig_id, wig_name=p["name"], status="error",
-                     error=str(e.detail), model=MODEL, duration_ms=int((time.time() - started) * 1000))
-        raise
+def garment_fit(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np.ndarray, M: np.ndarray | None):
+    """Line her garment up with the result's. Returns (her photo moved onto the result, her garment mask
+    there, overlap 0..1 of the two garments) or None when either picture shows no clothes."""
+    H, W = out.shape[:2]
+    if M is None:
+        M = np.float32([[W / src.shape[1], 0, 0], [0, H / src.shape[0], 0]])
+    warp = lambda x, f=cv2.INTER_LINEAR: cv2.warpAffine(x, M, (W, H), flags=f, borderMode=cv2.BORDER_REPLICATE)
+    src_w = warp(src)
+    c_src = warp(np.ascontiguousarray(seg_src[..., CLOTHES]), cv2.INTER_LINEAR)
+    c_out = seg_out[..., CLOTHES]
+    if (c_src > 0.5).sum() < 1500:
+        return None  # she shows no clothes to keep
+    if (c_out > 0.5).sum() < 1500:
+        return src_w, c_src, 0.0  # her clothes are gone from the result
+    # The body can sit a little differently from the face: line the garments up with each other
+    (dx, dy), _ = cv2.phaseCorrelate(c_src.astype(np.float64), c_out.astype(np.float64))
+    if abs(dx) < 0.08 * W and abs(dy) < 0.08 * H:
+        T = np.float32([[1, 0, dx], [0, 1, dy]])
+        src_w = cv2.warpAffine(src_w, T, (W, H), borderMode=cv2.BORDER_REPLICATE)
+        c_src = cv2.warpAffine(c_src, T, (W, H))
+    # compare only where the new hair doesn't cover (long hair hides part of any garment)
+    free = seg_out[..., HAIR] < 0.35
+    # only inside her photo: below a close selfie the AI simply continues her top, that is not a change
+    free &= cv2.warpAffine(np.ones(src.shape[:2], np.float32), M, (W, H)) > 0.99
+    a, b = (c_src > 0.5) & free, (c_out > 0.5) & free
+    iou = float((a & b).sum()) / float((a | b).sum() + 1)
+    return src_w, c_src, iou
 
-    before_jpg, after_jpg = encode(result["before"], ".jpg"), encode(result["after"], ".jpg")
-    db.add_tryon(session_id=session_id, wig_id=wig_id, wig_name=p["name"], status="ok",
-                 before_img=db.save_photo(before_jpg), after_img=db.save_photo(after_jpg),
-                 face_locked=int(result["locked"]), model=MODEL,
-                 duration_ms=int((time.time() - started) * 1000))
-    out = {"wig_id": wig_id, "before": data_url(before_jpg), "after": data_url(after_jpg),
-           "faceLocked": result["locked"], "mode": result["mode"]}
-    _cache[key] = out
-    if len(_cache) > 50:
-        _cache.popitem(last=False)
+
+def restore_clothes(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np.ndarray,
+                    M: np.ndarray | None) -> tuple[np.ndarray, str]:
+    """Her clothes, exactly as photographed, on the result.
+
+    1. The result's whole garment is recoloured to her garment's colours (so every bit the AI drew,
+       including between braids and at the edges, is already the right colour: no odd rims).
+    2. Her real garment pixels then go on top wherever the result has clothes and no hair.
+    Only the CLOTHES class is used (never background or accessories), hair always stays the AI's,
+    and nothing happens if her garment can't be lined up with the result's.
+    Returns (image, note for the log)."""
+    H, W = out.shape[:2]
+    fit = garment_fit(src, seg_src, out, seg_out, M)
+    if fit is None:
+        return out, "no clothes to keep"
+    src_w, c_src, iou = fit
+    c_out = seg_out[..., CLOTHES]
+    a, b = c_src > 0.5, c_out > 0.5
+    if iou < 0.3:
+        return out, f"garment shape too different to line up (overlap {iou:.2f})"
+    colour_only = iou < 0.5  # lined up too loosely to place her pixels, but her colours still apply
+
+    hair = np.clip((seg_out[..., HAIR] - 0.35) / 0.3, 0, 1).astype(np.float32)
+    # 1. recolour the AI's garment to hers (mean and spread per Lab channel)
+    lo, ls = _lab(out), _lab(src_w)
+    ref = ls[a & ~(hair > 0.5)] if (a & ~(hair > 0.5)).sum() > 800 else ls[a]
+    cur = lo[b & ~(hair > 0.5)] if (b & ~(hair > 0.5)).sum() > 800 else lo[b]
+    mr, sr, mo, so = ref.mean(0), ref.std(0) + 1e-3, cur.mean(0), cur.std(0) + 1e-3
+    k = np.clip(sr / so, 0.6, 1.6)
+    moved = (lo - mo) * k + mr
+    w1 = cv2.GaussianBlur(np.clip((c_out - 0.3) / 0.4, 0, 1).astype(np.float32), (0, 0), 1.5)
+    w1 = (w1 * (1 - hair))[..., None]
+    lo = lo * (1 - w1) + moved * w1
+    res = _rgb(lo)
+    if colour_only:
+        return _to_u8(res), f"recoloured only (overlap {iou:.2f})"
+    # 2. her real garment where both pictures have it and no hair lies on it
+    grow = cv2.dilate(b.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+    keep = (a & grow).astype(np.float32)
+    keep = cv2.erode(keep, np.ones((3, 3), np.uint8))
+    hair_block = cv2.dilate((seg_out[..., HAIR] > 0.35).astype(np.uint8),
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))).astype(np.float32)
+    keep = cv2.GaussianBlur(keep * (1 - hair_block), (0, 0), 1.2)[..., None]
+    res = src_w.astype(np.float32) * keep + res * (1 - keep)
+    return _to_u8(res), f"kept (overlap {iou:.2f}, {float(keep.mean()) * 100:.0f}% of picture)"
+
+
+def keep_body(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np.ndarray,
+              M: np.ndarray, inset: int = 2, follow: bool = False,
+              valid: np.ndarray | None = None, no_paste: np.ndarray | None = None) -> tuple[np.ndarray, str]:
+    """Her own body and clothes, always, by construction (whatever the AI drew there).
+
+    The AI's picture supplies only the new hair, the head and the backdrop. Her real clothes, arms,
+    hands and neck from her photo are placed exactly where they belong relative to her face (the face
+    was already put back the same way), under the new hair. Anything the AI invented outside her real
+    body (a new shirt, extra shoulders) becomes backdrop. Returns (image, note for the log)."""
+    H, W = out.shape[:2]
+    warp = lambda x, f=cv2.INTER_LINEAR, b=cv2.BORDER_CONSTANT: cv2.warpAffine(x, M, (W, H), flags=f, borderMode=b)
+    src_w = warp(src, b=cv2.BORDER_REFLECT).astype(np.float32)
+    inside = cv2.erode((warp(np.ones(src.shape[:2], np.float32)) > 0.99).astype(np.uint8),
+                       np.ones((5, 5), np.uint8)).astype(np.float32)  # pixels that really come from her photo
+    seg_w = np.stack([warp(np.ascontiguousarray(seg_src[..., i])) for i in range(seg_src.shape[-1])], -1)
+    body = np.clip(seg_w[..., CLOTHES] + seg_w[..., BODY_SKIN], 0, 1)
+    near = cv2.dilate((body > 0.5).astype(np.uint8), np.ones((int(0.05 * W) | 1,) * 2, np.uint8)).astype(np.float32)
+    body = np.clip(body + seg_w[..., OTHERS] * near, 0, 1)  # bags, straps, jewellery on her
+    # Light or shiny garments (a white top under a jacket, satin) are often missed by the segmenter and
+    # come out as holes in her body. Close small gaps and fill enclosed holes, so they stay hers instead
+    # of turning into backdrop. Large enclosed areas (real background between arm and body) stay open.
+    bb = (body > 0.5).astype(np.uint8)
+    k = int(0.02 * W) | 1
+    bb = cv2.morphologyEx(bb, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    inv = (1 - bb).astype(np.uint8)
+    n, lab_, stats, _ = cv2.connectedComponentsWithStats(inv, connectivity=4)
+    for i in range(1, n):
+        x, y, w_, h_, area = stats[i]
+        touches = x == 0 or y == 0 or x + w_ >= W or y + h_ >= H
+        if not touches and area < 0.04 * H * W:
+            bb[lab_ == i] = 1
+    body = np.maximum(body, bb.astype(np.float32) * 0.99)
+    if (body > 0.5).sum() < 1500:
+        return out, "no body to keep"
+    old_hair = seg_w[..., HAIR]
+    new_hair = seg_out[..., HAIR]
+    res = _lab(out)
+
+    # 1. The AI's clothes take her garment's colours (for any bit of them that stays visible).
+    c_src, c_out = seg_w[..., CLOTHES] > 0.5, (seg_out[..., CLOTHES] > 0.5) & (new_hair < 0.35)
+    if c_src.sum() > 800 and c_out.sum() > 800:
+        ls = _lab(src_w)
+        mr, sr = ls[c_src].mean(0), ls[c_src].std(0) + 1e-3
+        mo, so = res[c_out].mean(0), res[c_out].std(0) + 1e-3
+        moved = (res - mo) * np.clip(sr / so, 0.6, 1.6) + mr
+        w = cv2.GaussianBlur(np.clip((seg_out[..., CLOTHES] - 0.3) / 0.4, 0, 1).astype(np.float32), (0, 0), 1.5)
+        w = (w * (1 - np.clip((new_hair - 0.35) / 0.3, 0, 1)))[..., None]
+        res = res * (1 - w) + moved * w
+    res = _rgb(res)
+
+    # 2. Body the AI invented where her photo had only background: plain backdrop instead.
+    #    (skipped on the blended pass: there the AI already finished those edges)
+    ai_body = np.clip(seg_out[..., CLOTHES] + seg_out[..., BODY_SKIN] + seg_out[..., OTHERS], 0, 1)
+    was_bg = (body < 0.3) & (old_hair < 0.3) & (seg_w[..., FACE_SKIN] < 0.3)
+    # Only where her photo really shows background. Outside her photo (below its bottom edge, the room
+    # added above/beside a close selfie) the AI's drawing is the only picture there is, so it stays.
+    cover = np.ones(src.shape[:2], np.float32) if valid is None else valid.astype(np.float32)
+    cover = warp(cover) > 0.99
+    cover = cv2.erode(cover.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)  # right up to her photo's edge
+    was_bg &= cover
+    invented = ((ai_body > 0.5) & was_bg & (new_hair < 0.35)).astype(np.uint8)
+    invented = cv2.morphologyEx(invented, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    # follow = the AI re-posed her: keep its pose (her arms where it put them), so nothing of her old
+    # pose is pasted where the result has no body (no floating sleeves or hands)
+    # Only on the first assembly. After the AI blend pass its edges, shadows and the surface under her
+    # arms are what make the picture whole, so they stay (stray pieces are caught by tidy_body).
+    if invented.any() and not follow and inset <= 2:
+        bgm = cv2.erode((seg_out[..., BG] > 0.7).astype(np.uint8), np.ones((7, 7), np.uint8)).astype(np.float32)
+        sig = max(8.0, 0.08 * W)
+        num = cv2.GaussianBlur(out.astype(np.float32) * bgm[..., None], (0, 0), sig)
+        den = cv2.GaussianBlur(bgm, (0, 0), sig)[..., None]
+        fallback = np.median(out[bgm > 0], axis=0).astype(np.float32) if bgm.sum() > 500 else np.float32([225, 225, 225])
+        plate = np.where(den > 0.05, num / np.maximum(den, 1e-3), fallback)
+        a = cv2.GaussianBlur(cv2.dilate(invented, np.ones((11, 11), np.uint8)).astype(np.float32), (0, 0), 3.0)
+        a = (a * (1 - np.clip((new_hair - 0.2) / 0.3, 0, 1)))[..., None]  # never wash out the new hair
+        res = res * (1 - a) + plate * a
+
+    # 3. Her real body on top, under the new hair. Edge pulled in 1 px so none of her old room shows.
+    # (inset > 1: only the inside of her clothes/body, the edges stay as the AI blended them)
+    e = 2 * inset + 1
+    keep = cv2.erode((body > 0.5).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (e, e))).astype(np.float32)
+    g = 2 * max(2, inset // 2) + 1
+    block = cv2.dilate((new_hair > 0.35).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (g, g)))
+    if follow:
+        there = cv2.dilate((ai_body > 0.5).astype(np.uint8), np.ones((5, 5), np.uint8)).astype(np.float32)
+        keep *= there
+    keep = keep * inside
+    if no_paste is not None:  # (e.g. the neck under an AI face: the AI's own neck joins it seamlessly)
+        keep *= 1 - cv2.GaussianBlur(no_paste.astype(np.float32), (0, 0), max(2.0, 0.01 * W))
+    if valid is not None:  # nor from the soft room added around a close selfie
+        keep *= cv2.erode((warp(valid.astype(np.float32)) > 0.99).astype(np.uint8), np.ones((5, 5), np.uint8))
+    keep = cv2.GaussianBlur(keep * (1 - block), (0, 0), max(1.0, inset / 2.5))[..., None]
+    res = src_w * keep + res * (1 - keep)
+    return _to_u8(res), f"kept ({float(keep.mean()) * 100:.0f}% of picture, {int(invented.sum())} invented px removed)"
+
+
+def tidy_body(out: np.ndarray, seg: np.ndarray) -> tuple[np.ndarray, int]:
+    """Last safety net on the finished picture: any piece of clothing or skin that floats on its own,
+    not joined to her body (a stray sleeve, a hand left from an old pose, a patch at the edge), is
+    replaced with the backdrop. Her body, face and the hair are never touched. Returns (image, pieces)."""
+    H, W = out.shape[:2]
+    person = np.clip(seg[..., CLOTHES] + seg[..., BODY_SKIN] + seg[..., FACE_SKIN] + seg[..., HAIR]
+                     + seg[..., OTHERS], 0, 1) > 0.5
+    # jewellery and glasses (earrings, necklaces) are hers even when they float apart: never removed
+    keep_alone = seg[..., OTHERS] > 0.3
+    n, lab_, stats, _ = cv2.connectedComponentsWithStats(person.astype(np.uint8), connectivity=8)
+    if n <= 2:
+        return out, 0
+    face = seg[..., FACE_SKIN] > 0.5
+    main = max(range(1, n), key=lambda i: (face[lab_ == i].sum(), stats[i][4]))  # the piece with her face
+    stray = np.zeros((H, W), np.uint8)
+    for i in range(1, n):
+        if i != main and stats[i][4] < 0.015 * H * W:  # specks and slivers, never a real part of the picture
+            stray[lab_ == i] = 1
+    stray &= ((seg[..., HAIR] < 0.35)).astype(np.uint8)  # loose curls are allowed to float
+    stray &= (~keep_alone).astype(np.uint8)
+    # nothing near her face is ever a stray piece (earrings, fingers, collar points)
+    face = cv2.dilate((seg[..., FACE_SKIN] > 0.5).astype(np.uint8), np.ones((int(0.12 * W) | 1,) * 2, np.uint8))
+    stray &= (1 - face).astype(np.uint8)
+    if not stray.any():
+        return out, 0
+    bgm = cv2.erode((seg[..., BG] > 0.7).astype(np.uint8), np.ones((7, 7), np.uint8)).astype(np.float32)
+    sig = max(8.0, 0.08 * W)
+    num = cv2.GaussianBlur(out.astype(np.float32) * bgm[..., None], (0, 0), sig)
+    den = cv2.GaussianBlur(bgm, (0, 0), sig)[..., None]
+    fallback = np.median(out[bgm > 0], axis=0).astype(np.float32) if bgm.sum() > 500 else np.float32([225, 225, 225])
+    plate = np.where(den > 0.05, num / np.maximum(den, 1e-3), fallback)
+    a = cv2.GaussianBlur(cv2.dilate(stray, np.ones((9, 9), np.uint8)).astype(np.float32), (0, 0), 2.5)
+    a = (a * (1 - np.clip((seg[..., HAIR] - 0.2) / 0.3, 0, 1)))[..., None]
+    res = out.astype(np.float32) * (1 - a) + plate * a
+    return _to_u8(res), int(n - 2)
+
+
+def no_new_hands(out: np.ndarray, seg_out: np.ndarray, src_skin_w: np.ndarray,
+                 inside: np.ndarray | None = None) -> tuple[np.ndarray, int]:
+    """Remove skin the AI drew where her photo has no skin (a second pair of hands, a new arm).
+    Her own hands and arms, wherever they are visible, stay; hands hidden behind the new hair stay hidden.
+    src_skin_w: her body-skin probability moved onto the result. Returns (image, removed px)."""
+    H, W = out.shape[:2]
+    mine = cv2.dilate((src_skin_w > 0.3).astype(np.uint8), np.ones((int(0.02 * W) | 1,) * 2, np.uint8))
+    new = ((seg_out[..., BODY_SKIN] > 0.5) & (mine == 0) & (seg_out[..., HAIR] < 0.35)).astype(np.uint8)
+    if inside is not None:  # only within her photo: below/around it the AI's picture is all there is
+        new &= cv2.erode(inside.astype(np.uint8), np.ones((int(0.03 * W) | 1,) * 2, np.uint8))
+    new = cv2.morphologyEx(new, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    # only real pieces (a hand is not a few stray pixels)
+    n, lab_, stats, _ = cv2.connectedComponentsWithStats(new, connectivity=8)
+    keep = np.zeros_like(new)
+    for i in range(1, n):
+        if stats[i][4] > 0.002 * H * W:
+            keep[lab_ == i] = 1
+    if not keep.any():
+        return out, 0
+    # removed smoothly (inpainting smears streaks across the picture)
+    m = cv2.dilate(keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+    # fill from what surrounds it (her top, or the backdrop), never from hair: a smooth patch, no streaks
+    ok = ((m == 0) & (seg_out[..., HAIR] < 0.35)).astype(np.float32)
+    plate = out.astype(np.float32)
+    for sig in (0.02 * W, 0.05 * W, 0.12 * W):
+        num = cv2.GaussianBlur(out.astype(np.float32) * ok[..., None], (0, 0), max(3.0, sig))
+        den = cv2.GaussianBlur(ok, (0, 0), max(3.0, sig))[..., None]
+        fill = num / np.maximum(den, 1e-3)
+        plate = np.where((den > 0.15) & (m[..., None] > 0) & (plate == out), fill, plate)
+    a = cv2.GaussianBlur(m.astype(np.float32), (0, 0), 3.0)
+    a = (a * (1 - np.clip((seg_out[..., HAIR] - 0.2) / 0.3, 0, 1)))[..., None]
+    res = out.astype(np.float32) * (1 - a) + plate * a
+    return _to_u8(res), int(keep.sum())
+
+
+def match_backdrop(out: np.ndarray, seg: np.ndarray, rgb) -> np.ndarray:
+    """One flat, even backdrop in the exact colour, edge to edge. Every background pixel (the AI's backdrop,
+    the room added around a close selfie, any filled edge) becomes exactly that colour, so there are no
+    bands, frames or patches. Hair and her body are never recoloured: only pixels that are background AND
+    already look like the backdrop change, so strands and soft hair edges keep their own colour."""
+    lab = _lab(out)
+    target = _lab(np.uint8(rgb).reshape(1, 1, 3))[0, 0]
+    W = out.shape[1]
+    bg = cv2.GaussianBlur(np.clip((seg[..., BG] - 0.3) / 0.4, 0, 1).astype(np.float32), (0, 0), max(1.5, 0.003 * W))
+    # how much each pixel looks like a pinkish/plain backdrop (any shade the AI or the fill gave it)
+    d = np.sqrt(0.35 * (lab[..., 0] - target[0]) ** 2 + (lab[..., 1] - target[1]) ** 2 + (lab[..., 2] - target[2]) ** 2)
+    like = np.clip((60.0 - d) / 25.0, 0, 1)
+    # a plain grey/white area the AI left (no pink at all) is backdrop too when the segmenter is sure
+    like = np.maximum(like, (seg[..., BG] > 0.95) * (np.hypot(lab[..., 1] - 128, lab[..., 2] - 128) < 12))
+    # any pink/magenta shade the AI painted (lighter or deeper than asked) is backdrop too
+    pinkish = np.clip((lab[..., 1] - 128 - 15) / 10, 0, 1) * np.clip((15 - (lab[..., 2] - 128)) / 10, 0, 1)
+    like = np.maximum(like, pinkish)
+    # never inside her silhouette (glasses lenses, gaps between arm and body, reflections): only the
+    # background that is connected to the edges of the picture is backdrop
+    person = (seg[..., BG] < 0.5).astype(np.uint8)
+    inv = (1 - person).astype(np.uint8)
+    n, lab_, stats, _ = cv2.connectedComponentsWithStats(inv, connectivity=4)
+    H = out.shape[0]
+    outside = np.zeros_like(inv)
+    for i in range(1, n):
+        x, y, w_, h_, _a = stats[i]
+        if x == 0 or y == 0 or x + w_ >= W or y + h_ >= H:
+            outside[lab_ == i] = 1
+    # never on or near her face (glasses lenses and their reflections, earrings)
+    near_face = cv2.dilate(((seg[..., FACE_SKIN] > 0.4) | (seg[..., OTHERS] > 0.4)).astype(np.uint8),
+                           np.ones((int(0.05 * W) | 1,) * 2, np.uint8))
+    outside[near_face > 0] = 0
+    # well away from her, every background pixel is backdrop, whatever shade it has (no lines or marks)
+    far = cv2.distanceTransform(outside, cv2.DIST_L2, 5) > 0.03 * W
+    like = np.where(far, 1.0, like)
+    outside = cv2.GaussianBlur(outside.astype(np.float32), (0, 0), 1.0)
+    w = (bg * like * outside).astype(np.float32)[..., None]  # no extra blur: thin strands keep their colour
+    flat = np.empty_like(lab)
+    flat[:] = target
+    return _to_u8(_rgb(lab * (1 - w) + flat * w))
+
+def added_hands(seg_src: np.ndarray, seg_out: np.ndarray, M: np.ndarray) -> np.ndarray:
+    """uint8 mask of hands/arms (skin) in the result that are not in her photo. Her face, neck and any
+    skin she shows are excluded (with a margin), hair over skin is ignored, specks are ignored."""
+    H, W = seg_out.shape[:2]
+    her = np.clip(seg_src[..., BODY_SKIN] + seg_src[..., FACE_SKIN], 0, 1).astype(np.float32)
+    her = cv2.warpAffine(np.ascontiguousarray(her), M, (W, H)) > 0.3
+    her = cv2.dilate(her.astype(np.uint8), np.ones((int(0.04 * W) | 1,) * 2, np.uint8))
+    new = ((seg_out[..., BODY_SKIN] > 0.5) & (her == 0) & (seg_out[..., HAIR] < 0.35)).astype(np.uint8)
+    new = cv2.morphologyEx(new, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    n, lab_, stats, _ = cv2.connectedComponentsWithStats(new, connectivity=8)
+    out = np.zeros_like(new)
+    for i in range(1, n):
+        if stats[i][4] > 0.003 * H * W:
+            out[lab_ == i] = 1
     return out
 
 
-OUTFIT_MODEL = os.getenv("OUTFIT_MODEL", "gpt-4o-mini")
+def head_gaps(lm_out: np.ndarray, seg_out: np.ndarray, want_mask: bool = False, shoulders: bool = True):
+    """Where the wig fails to cover her head: checks a band around the top and sides of her face (forehead
+    line up to the crown, temples, beside the ears) for hair. Returns "" or e.g. "left side ...";
+    with want_mask=True returns (text, uint8 mask of the bare parts of that band, widened outward)."""
+    H, W = seg_out.shape[:2]
+    oval = lm_out[FACE_OVAL]
+    c = oval.mean(axis=0)
+    g = geom(lm_out)
+    outer = np.zeros((H, W), np.uint8)
+    inner = np.zeros((H, W), np.uint8)
+    cv2.fillPoly(outer, [np.round(c + (oval - c) * 1.35 + g.up * 0.12 * g.height).astype(np.int32)], 1)
+    cv2.fillPoly(inner, [np.round(c + (oval - c) * 1.04).astype(np.int32)], 1)
+    ring = (outer > 0) & (inner == 0)
+    # only the upper part (eyes up) and the sides down to the mouth: below that the hair may fall away
+    ys, xs = np.mgrid[0:H, 0:W]
+    height = (xs - g.chin[0]) * g.up[0] + (ys - g.chin[1]) * g.up[1]
+    ring &= height > 0.35 * g.height
+    side = -(xs - c[0]) * g.up[1] + (ys - c[1]) * g.up[0]  # across the face axis: picture-left < 0
+    hair = seg_out[..., HAIR] > 0.4
+    bad, mask = [], np.zeros((H, W), np.uint8)
+    for name, sel in (("left side (as seen in the picture)", side < -0.15 * g.width),
+                      ("right side (as seen in the picture)", side > 0.15 * g.width),
+                      ("top", np.abs(side) <= 0.15 * g.width)):
+        r = ring & sel
+        if r.sum() > 200 and hair[r].mean() < 0.45:
+            bad.append(name)
+            mask |= (r & ~hair).astype(np.uint8)
+    # hair over BOTH shoulders: beside the neck, from the chin down, on each side of the face
+    below = (height < 0.05 * g.height) & (height > -0.7 * g.height)
+    for name, sel in () if not shoulders else (("left shoulder (as seen in the picture)", (side < -0.55 * g.width) & (side > -1.15 * g.width)),
+                      ("right shoulder (as seen in the picture)", (side > 0.55 * g.width) & (side < 1.15 * g.width))):
+        r = below & sel
+        if r.sum() > 400 and hair[r].mean() < 0.3:
+            bad.append(name)
+            mask |= (r & ~hair).astype(np.uint8)
+    text = " and ".join(bad)
+    if not want_mask:
+        return text
+    if mask.any():
+        # room for the braids to fall: widen outward and down the side, never into the face
+        big = np.zeros((H, W), np.uint8)
+        cv2.fillPoly(big, [np.round(c + (oval - c) * 1.7 + g.up * 0.15 * g.height).astype(np.int32)], 1)
+        big |= (below & (np.abs(side) < 1.2 * g.width)).astype(np.uint8)  # down over the shoulders too
+        grow = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(0.25 * g.width) | 1,) * 2))
+        mask = (grow & big & (inner == 0)).astype(np.uint8)
+    return text, mask
 
 
-async def describe_outfit(crop: np.ndarray) -> str:
-    """One line describing exactly what she is wearing, so the image prompt can name it (the image
-    model keeps clothes far better when told what they are). Empty if it can't be had quickly."""
-    try:
-        ok, jpg = cv2.imencode(".jpg", cv2.cvtColor(crop, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 85])
-        url = "data:image/jpeg;base64," + base64.b64encode(jpg.tobytes()).decode()
-        res = await asyncio.wait_for(openai_client().chat.completions.create(
-            model=OUTFIT_MODEL, max_tokens=60, temperature=0,
-            messages=[{"role": "user", "content": [
-                {"type": "text", "text": "Describe only the clothing this person wears on the upper body, in one short "
-                 "line: garment type, exact colour, plain or the exact pattern, neckline or collar, buttons, and any "
-                 "necklace or glasses. No other words."},
-                {"type": "image_url", "image_url": {"url": url, "detail": "low"}}]}]), timeout=15)
-        text = (res.choices[0].message.content or "").strip().replace("\n", " ")
-        return text[:240]
-    except Exception as e:
-        log.warning("outfit description skipped: %s", e)
+def face_match(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.ndarray) -> float:
+    """How closely the result's eyes, brows, nose and mouth look like hers (not just where they are):
+    the result is lined up on her face and the feature areas are compared in grey, after removing overall
+    brightness and contrast (so light smoothing and relighting don't count). 1 = identical, 0 = unrelated."""
+    M = align(src_lm, out_lm, strict=False)
+    if M is None:
+        return 0.0
+    H, W = src.shape[:2]
+    back = cv2.warpAffine(out, cv2.invertAffineTransform(M), (W, H), flags=cv2.INTER_LINEAR)
+    g = geom(src_lm)
+    fw = float(np.linalg.norm(src_lm[234] - src_lm[454]))
+    feats = np.zeros((H, W), np.uint8)
+    for idx, grow in ((LEFT_EYE, 0.06), (RIGHT_EYE, 0.06), (LEFT_BROW, 0.04), (RIGHT_BROW, 0.04),
+                      (LIPS, 0.04), (NOSTRILS, 0.04)):
+        feats = np.maximum(feats, (_poly_mask((H, W), src_lm[idx], grow=max(1, int(grow * fw))) > 0.5).astype(np.uint8))
+    m = feats > 0
+    if m.sum() < 200:
+        return 0.0
+    a = cv2.cvtColor(src, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    b = cv2.cvtColor(back, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    # detail only (features), not broad light
+    s = max(2.0, 0.03 * fw)
+    a -= cv2.GaussianBlur(a, (0, 0), s)
+    b -= cv2.GaussianBlur(b, (0, 0), s)
+    a, b = a[m], b[m]
+    a = (a - a.mean()) / (a.std() + 1e-3)
+    b = (b - b.mean()) / (b.std() + 1e-3)
+    return float((a * b).mean())
+
+
+def neck_band(shape, lm: np.ndarray) -> np.ndarray:
+    """uint8 mask of the jaw/neck area just under the chin (where an AI face meets her real neck)."""
+    H, W = shape[:2]
+    g = geom(lm)
+    ys, xs = np.mgrid[0:H, 0:W]
+    height = (xs - g.chin[0]) * g.up[0] + (ys - g.chin[1]) * g.up[1]
+    across = -(xs - g.chin[0]) * g.up[1] + (ys - g.chin[1]) * g.up[0]
+    return ((height < 0.15 * g.height) & (height > -0.45 * g.height) & (np.abs(across) < 0.7 * g.width)).astype(np.uint8)
+
+
+def bare_scalp(lm_out: np.ndarray, seg_out: np.ndarray, want_mask: bool = False, strict: bool = True):
+    """True when skin shows on top of the head above the hairline (a wide bare part or an uncovered high
+    forehead): the strip from a normal hairline up to the crown, around the middle of the head."""
+    H, W = seg_out.shape[:2]
+    g = geom(lm_out)
+    c = lm_out[FACE_OVAL].mean(axis=0)
+    ys, xs = np.mgrid[0:H, 0:W]
+    height = (xs - g.chin[0]) * g.up[0] + (ys - g.chin[1]) * g.up[1]
+    across = -(xs - c[0]) * g.up[1] + (ys - c[1]) * g.up[0]
+    brow = float(((lm_out[BROWS] - g.chin) @ g.up).max())
+    # start just above the top of her forehead (face-mesh point 10), never on the forehead itself
+    fore = float((lm_out[FOREHEAD] - g.chin) @ g.up)
+    top = (height > fore + 0.06 * g.height) & (height < fore + 0.4 * g.height) & (np.abs(across) < 0.35 * g.width)
+    if top.sum() < 300:
+        return False
+    skin = (seg_out[..., FACE_SKIN] + seg_out[..., BODY_SKIN]) > 0.5
+    if strict:
+        bad = float(skin[top].mean()) > 0.12 or int((skin & top).sum()) > 0.02 * g.width * g.height
+    else:  # only a clearly raised hairline (a "bald" look), measured in the middle above her real forehead
+        mid = top & (np.abs(across) < 0.18 * g.width) & (height < fore + 0.25 * g.height)
+        bad = mid.sum() > 200 and float(skin[mid].mean()) > 0.35
+    if not want_mask:
+        return bad
+    # the skin above a normal hairline, across the whole top of the head (to be covered with hair)
+    crown = (height > fore + 0.04 * g.height) & (np.abs(across) < 0.6 * g.width)
+    mask = (crown & skin).astype(np.uint8) if bad else np.zeros((H, W), np.uint8)
+    mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(0.06 * g.width) | 1,) * 2))
+    return bad, mask
+
+
+def mirror_hair(out: np.ndarray, seg: np.ndarray, lm: np.ndarray, area: np.ndarray) -> np.ndarray:
+    """Cover `area` (bare skin on the head) with the hair at the mirror position across her face's centre
+    line; where the mirror side has no hair either, the nearest hair colour is used. Soft edges."""
+    H, W = out.shape[:2]
+    g = geom(lm)
+    c = lm[FACE_OVAL].mean(axis=0)
+    ux, uy = float(g.up[0]), float(g.up[1])
+    nx, ny = -uy, ux  # across the face
+    ys, xs = np.mgrid[0:H, 0:W].astype(np.float32)
+    d = (xs - c[0]) * nx + (ys - c[1]) * ny
+    mx, my = xs - 2 * d * nx, ys - 2 * d * ny
+    mirrored = cv2.remap(out, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    m_hair = cv2.remap((seg[..., HAIR] > 0.5).astype(np.float32), mx, my, cv2.INTER_LINEAR) > 0.5
+    hair = seg[..., HAIR] > 0.5
+    fill = mirrored.astype(np.float32)
+    need = (area > 0) & ~m_hair
+    if need.any() and hair.any():
+        # no hair on the mirror side either: copy the nearest real hair beside or above the patch
+        ys_, xs_ = np.where(area > 0)
+        bh = int(ys_.max() - ys_.min() + 0.04 * g.height)
+        bw = int(xs_.max() - xs_.min() + 0.04 * g.width)
+        left = need.copy()
+        for dy, dx in ((0, bw), (0, -bw), (bh, 0), (bh, bw), (bh, -bw), (2 * bh, 0)):
+            if not left.any():
+                break
+            src = np.roll(np.roll(out, dy, axis=0), dx, axis=1).astype(np.float32)
+            ok = np.roll(np.roll(hair, dy, axis=0), dx, axis=1) & left
+            fill[ok] = src[ok]
+            left &= ~ok
+        if left.any():  # still nothing: the wig's typical hair colour
+            fill[left] = np.median(out[hair], axis=0)
+    a = cv2.GaussianBlur((area > 0).astype(np.float32), (0, 0), max(1.5, 0.004 * W))[..., None]
+    return np.clip(out * (1 - a) + fill * a, 0, 255).astype(np.uint8)
+
+
+def hair_hint(img: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, seg: np.ndarray | None = None) -> np.ndarray:
+    """The photo given to the AI with everything on the top of her head above a normal hairline (her own hair,
+    a headband, scarf or cap, and any forehead skin above that line) softly covered in the wig's hair colour.
+    The AI then draws the wig's hairline there instead of revealing bare skin (the "bald" look). Her face below
+    the hairline is untouched, and the AI repaints the whole area as real braids."""
+    m = _wig_pixels(wig_rgb)
+    if m.sum() < 1000:
+        return img
+    hair_col = np.median(wig_rgb[m > 0][:, :3], axis=0).astype(np.float32)
+    # the wig's top colour (roots are usually darker than the ends)
+    ys = np.nonzero(m)[0]
+    top_rows = m.copy()
+    top_rows[int(ys.min() + 0.3 * np.ptp(ys)):] = 0
+    if top_rows.sum() > 500:
+        hair_col = np.median(wig_rgb[top_rows > 0][:, :3], axis=0).astype(np.float32)
+    H, W = img.shape[:2]
+    g = geom(lm)
+    fore = lm[FOREHEAD]
+    yy, xx = np.mgrid[0:H, 0:W]
+    height = (xx - g.chin[0]) * g.up[0] + (yy - g.chin[1]) * g.up[1]
+    fh = float((fore - g.chin) @ g.up)
+    across = -(xx - fore[0]) * g.up[1] + (yy - fore[1]) * g.up[0]
+    # head top: an ellipse over the skull from just under the forehead top line
+    rx, ry = 0.62 * g.width, 0.55 * g.height
+    cy_ = fh + 0.05 * g.height
+    skull = (across / rx) ** 2 + (np.maximum(height - cy_, 0) / ry) ** 2 < 1.0
+    zone = skull & (height > fh)
+    if seg is not None:  # plus her own hair/headband touching the head (not the background)
+        head_stuff = (seg[..., HAIR] + seg[..., OTHERS] + seg[..., CLOTHES]) > 0.5
+        zone |= head_stuff & (height > fh) & (np.abs(across) < 0.9 * g.width)
+    a = cv2.GaussianBlur(zone.astype(np.float32), (0, 0), max(2.0, 0.025 * g.height))
+    a = np.clip(a * 1.3, 0, 1)
+    a *= np.clip((height - (fh - 0.02 * g.height)) / (0.08 * g.height), 0, 1)  # soft, never over the brows/eyes
+    rng = np.random.default_rng(5)
+    tex = cv2.GaussianBlur(rng.normal(0, 18, (H, W)).astype(np.float32), (0, 0), 1.2)[..., None]
+    fill = np.clip(hair_col + tex, 0, 255)
+    a = a[..., None]
+    return np.clip(img * (1 - a) + fill * a, 0, 255).astype(np.uint8)
+
+
+def covered_hairline(lm: np.ndarray, seg: np.ndarray) -> str:
+    """Why her own hairline can't guide the AI: "headwear" (headband, scarf, cap over the top of the forehead),
+    "high forehead" (bare skin high above the forehead), or "" when her hairline is visible and normal."""
+    H, W = seg.shape[:2]
+    g = geom(lm)
+    fh = float((lm[FOREHEAD] - g.chin) @ g.up)
+    yy, xx = np.mgrid[0:H, 0:W]
+    height = (xx - g.chin[0]) * g.up[0] + (yy - g.chin[1]) * g.up[1]
+    across = -(xx - lm[FOREHEAD][0]) * g.up[1] + (yy - lm[FOREHEAD][1]) * g.up[0]
+    band = (height > fh - 0.05 * g.height) & (height < fh + 0.3 * g.height) & (np.abs(across) < 0.6 * g.width)
+    if band.sum() < 300:
         return ""
-
-
-async def ai_edit(crop: np.ndarray, wig_rgb: np.ndarray, prompt: str, keep: np.ndarray | None = None,
-                  quality: str | None = None) -> np.ndarray:
-    kwargs = dict(
-        model=MODEL,
-        image=[("customer.png", encode(crop), "image/png"), ("wig.png", encode(wig_rgb), "image/png")],
-        prompt=prompt,
-        size=f"{OUT_W}x{OUT_H}",
-        quality=quality or QUALITY,
-        output_format="png",
-        n=1,
-    )
-    if keep is not None:
-        kwargs["mask"] = ("mask.png", openai_mask_png(keep), "image/png")  # opaque = do not edit
-    if supports_fidelity(MODEL):
-        kwargs["input_fidelity"] = "high"
-    try:
-        res = await openai_client().images.edit(**kwargs)
-    except APIStatusError as e:
-        log.warning("OpenAI error %s: %s", e.status_code, e.message)
-        msg = ("The AI couldn't process this photo. Try a different one."
-               if e.status_code == 400 else "The AI is busy right now, please try again.")
-        raise HTTPException(502, msg)
-    out = to_rgb(base64.b64decode(res.data[0].b64_json))
-    if out.shape[:2] != (OUT_H, OUT_W):
-        out = cv2.resize(out, (OUT_W, OUT_H), interpolation=cv2.INTER_CUBIC)
-    return out
-
-
-async def blend_pass(comp: np.ndarray, sent: np.ndarray, lm: np.ndarray, seg_src, wig_rgb: np.ndarray,
-                     p: dict, outfit: str) -> np.ndarray:
-    """AI retouch of the assembled result; returns the assembled one if anything goes wrong."""
-    try:
-        c_lm = await landmarks(comp)
-        c_seg = await segment(comp)
-        if c_lm is None or c_seg is None:
-            return comp
-        H, W = comp.shape[:2]
-        inner = max(6, int(0.02 * W))
-        body = (np.clip(c_seg[..., CLOTHES] + c_seg[..., BODY_SKIN], 0, 1) > 0.5).astype(np.uint8)
-        body = cv2.erode(body, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * inner + 1,) * 2))
-        hair = cv2.dilate((c_seg[..., HAIR] > 0.3).astype(np.uint8), np.ones((inner, inner), np.uint8))
-        keep = np.maximum((body * (1 - hair)) * 255, keep_mask(comp.shape, c_lm, shrink=0.85)).astype(np.uint8)
-        out2 = await ai_edit(comp, wig_rgb, build_prompt_blend(p, outfit), keep=keep, quality=BLEND_QUALITY)
-        o_lm = await landmarks(out2)
-        o_seg = await segment(out2)
-        M2 = align(lm, o_lm) if o_lm is not None else None
-        if M2 is None or o_seg is None:
-            log.info("blend pass: result not usable, keeping the assembled picture")
-            return comp
-        if SKIN_TONE > 0 and seg_src is not None:
-            out2 = keep_skin_tone(sent, seg_src, out2, o_seg, SKIN_TONE, exact=KEEP_FACE)
-        if KEEP_FACE:
-            out2, _ = face_lock(sent, lm, out2, o_lm, bool(p.get("bangs")), enhance=0, relight=0.25)
-        if KEEP_CLOTHES:
-            out2, how = keep_body(sent, seg_src, out2, o_seg, M2, inset=max(4, int(0.012 * W)))
-            log.info("blend pass: her clothes %s", how)
-            # No hands she isn't showing: skin the AI added where her photo has none is taken out
-            skin_w = cv2.warpAffine(np.ascontiguousarray(seg_src[..., BODY_SKIN]), M2, (W, H))
-            inside = cv2.warpAffine(np.ones(seg_src.shape[:2], np.float32), M2, (W, H)) > 0.99
-            out2, gone = no_new_hands(out2, o_seg, skin_w, inside)
-            if gone:
-                log.info("blend pass: removed %d px of hands/arms the AI added", gone)
-        return out2
-    except HTTPException:
-        log.warning("blend pass failed at the AI; keeping the assembled picture")
-        return comp
-    except Exception:
-        log.exception("blend pass failed; keeping the assembled picture")
-        return comp
-
-
-async def final_gate(out: np.ndarray, lm: np.ndarray, seg_src, p: dict) -> None:
-    try:
-        f_lm = await landmarks(out)
-        f_seg = await segment(out)
-    except Exception:
-        return
-    if f_lm is None or f_seg is None:
-        return
-    problems = []
-    M = align(lm, f_lm, strict=False)
-    if seg_src is not None and M is not None and added_hands(seg_src, f_seg, M).any():
-        problems.append("hands")
-    if head_gaps(f_lm, f_seg, shoulders=False):  # the head itself must be covered (shoulders may vary)
-        problems.append("head not covered")
-    if bare_scalp(her_face_on(lm, f_lm), f_seg):
-        problems.append("bare scalp")
-    if problems:
-        log.warning("quality gate stopped this result: %s", ", ".join(problems))
-        raise HTTPException(422, "We couldn't get a perfect result from this photo. Please take a new photo facing the "
-                                 "camera in good light, with your head and shoulders in view and nothing in front of "
-                                 "your face, and try again.")
-
-
-async def to_her_frame(out: np.ndarray, lm: np.ndarray, sent: np.ndarray, seg_src) -> np.ndarray:
-    try:
-        f_lm = await landmarks(out)
-        M = align(lm, f_lm) if f_lm is not None else None
-        if M is None and f_lm is not None:
-            M = align(lm, f_lm, strict=False)
-        if M is None:
-            return out
-        H, W = sent.shape[:2]
-        scale = float(np.sqrt(abs(np.linalg.det(M[:, :2]))))
-        if abs(scale - 1) < 0.01 and float(np.abs(M[:, 2]).max()) < 2:
-            return out  # already in her frame
-        Minv = cv2.invertAffineTransform(M)
-        back = cv2.warpAffine(out, Minv, (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT)
-        have = cv2.warpAffine(np.ones(out.shape[:2], np.float32), Minv, (W, H)) > 0.999
-        if not have.all():
-            # edges the AI's picture doesn't reach: her own photo there (her body), backdrop where she had none
-            fill = np.empty_like(sent)
-            fill[:] = BACKDROP_RGB
-            if seg_src is not None:
-                mine = np.clip(seg_src[..., BODY_SKIN] + seg_src[..., CLOTHES] + seg_src[..., HAIR], 0, 1)[..., None]
-                fill = (sent * mine + fill * (1 - mine)).astype(np.uint8)
-            a = cv2.GaussianBlur((~have).astype(np.float32), (0, 0), 2.0)[..., None]
-            back = np.clip(back * (1 - a) + fill * a, 0, 255).astype(np.uint8)
-        log.info("put back into her frame (the AI had scaled her by %.2f)", scale)
-        return back
-    except Exception:
-        log.exception("frame alignment skipped")
-        return out
-
-
-def her_face_on(lm: np.ndarray, f_lm: np.ndarray) -> np.ndarray:
-    """Her real face outline from her photo, placed on the result (lined up on eyes, nose, mouth). Used for the
-    head checks so a forehead the AI extended (a bump, a skin patch where a headband was) is never mistaken
-    for her forehead."""
-    M = align(lm, f_lm, strict=False)
-    return f_lm if M is None else (lm @ M[:, :2].T + M[:, 2]).astype(np.float32)
-
-
-async def fill_head_gaps(out: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dict) -> np.ndarray:
-    """Bare parts of the head (a side, the top, a shoulder, a bump of skin above her hairline) get the wig's hair.
-    1. the AI repaints those areas (twice at most), starting from hair colour so it can't keep the skin;
-    2. if any bare skin is still above her hairline, it is covered with the wig's own hair mirrored from the
-       other side of the centre part (the braids are symmetric), so a bump can never stay."""
-    try:
-        W = out.shape[1]
-        desc = p.get("description") or p["name"]
-        for round_ in range(2):
-            f_lm = await landmarks(out)
-            f_seg = await segment(out)
-            if f_lm is None or f_seg is None:
-                return out
-            her = her_face_on(lm, f_lm)
-            miss, area = head_gaps(her, f_seg, want_mask=True, shoulders=is_long(p))
-            if not miss or not area.any():
-                return out
-            log.info("wig did not cover the %s: adding the wig's hair there (round %d)", miss, round_ + 1)
-            # start the area from the wig's hair colour, so the AI paints hair there, not skin again
-            hair_px = out[(f_seg[..., HAIR] > 0.6) & (area == 0)]
-            base = out.copy()
-            if len(hair_px) > 500:
-                base[area > 0] = np.median(hair_px, axis=0).astype(np.uint8)
-            prompt = ("Image 2 is the wig she is wearing (" + desc + "). The editable area is part of her head that the "
-                      "wig must cover: paint the same wig hair there so the wig covers her whole head like a real, "
-                      "properly installed wig: the same braids, colours and style, a thin natural centre part, braids "
-                      "lying flat on the scalp from the part, covering the top of the head down to a natural hairline "
-                      "at the top of her forehead, covering the ears and falling over BOTH shoulders, joined seamlessly "
-                      "to the hair around it. No skin, scalp, bump, lace or background in that area. Do not change her "
-                      "face, clothes or anything outside the editable area. Keep the plain " + BACKDROP_WORDS +
-                      " backdrop. Photorealistic.")
-            fixed = await ai_edit(base, wig_rgb, prompt, keep=((1 - area) * 255).astype(np.uint8))
-            a = cv2.GaussianBlur(area.astype(np.float32), (0, 0), max(2.0, 0.006 * W))[..., None]
-            out = np.clip(out * (1 - a) + fixed * a, 0, 255).astype(np.uint8)
-        return out
-    except Exception:
-        log.exception("head gap fill skipped")
-        return out
-
-
-async def remove_added_hands(out: np.ndarray, lm: np.ndarray, seg_src, wig_rgb: np.ndarray) -> np.ndarray:
-    """Find hands/arms in the result that are not in her photo and have the AI repaint just those areas
-    (continuing her clothes and the backdrop). Everything outside them is left exactly as it is."""
-    try:
-        f_lm = await landmarks(out)
-        f_seg = await segment(out)
-        Mf = align(lm, f_lm, strict=False) if f_lm is not None else None
-        if Mf is None or f_seg is None:
-            return out
-        hands = added_hands(seg_src, f_seg, Mf)
-        if not hands.any():
-            return out
-        W = out.shape[1]
-        area = cv2.dilate(hands, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(0.04 * W) | 1,) * 2))
-        log.info("removing %d px of added hands/arms", int(hands.sum()))
-        prompt = ("Remove the hands and arms in the editable area completely. In their place continue what is around "
-                  "them: her own clothes (same garment, colour and pattern) and the plain " + BACKDROP_WORDS +
-                  " backdrop. Do not add any hand, arm or object. Keep the wig hair as it is. Everything outside the "
-                  "editable area stays exactly the same. Photorealistic, seamless.")
-        fixed = await ai_edit(out, wig_rgb, prompt, keep=((1 - area) * 255).astype(np.uint8), quality=BLEND_QUALITY)
-        a = cv2.GaussianBlur(area.astype(np.float32), (0, 0), max(2.0, 0.006 * W))[..., None]
-        return np.clip(out * (1 - a) + fixed * a, 0, 255).astype(np.uint8)
-    except Exception:
-        log.exception("hand removal skipped")
-        return out
-
-
-async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dict, seg_src, added,
-                   src_scale: float = 1.0) -> dict:
-    """The AI makes the final picture. The server only checks it (same person, same clothes, face in
-    place) and asks the AI again with a note on what went wrong if a check fails; the best is kept."""
-    # Skin smoothing on HER real face (tone, blemishes, noise; features and shape untouched), done on the
-    # photo before the AI sees it. The AI is then told to keep that face exactly and builds everything
-    # else around it, so the result is one natural photo with her own unchanged face.
-    body = None
-    if seg_src is not None:
-        body = cv2.GaussianBlur(np.clip((seg_src[..., BODY_SKIN] - 0.3) / 0.4, 0, 1), (0, 0), max(2.0, 0.01 * OUT_W))
-    sent = clean_photo(crop, lm, src_scale)
-    if FACE_ENHANCE > 0:
-        sent = beautify(sent, lm, FACE_ENHANCE, style="natural", skin_extra=body)
-    # Protect the face (brows to chin) in the AI edit; the forehead/hairline stays free for the wig
-    face_keep = keep_mask(crop.shape, lm, shrink=0.92)
-
-    # A headband/scarf/cap over her hairline, or a very high forehead, gives the AI no hairline to follow and it
-    # reveals bare skin there (the "bald" look). Then the AI gets her photo with the top of the head already in
-    # the wig's hair colour, so it draws the wig's hairline in the right place. Other photos go in unchanged.
-    sent_ai = sent
-    why_hint = covered_hairline(lm, seg_src) if (seg_src is not None and HAIRLINE_HINT) else ""
-    if why_hint:
-        sent_ai = hair_hint(sent, lm, wig_rgb, seg_src)
-        log.info("hairline hint given to the AI (%s)", why_hint)
-    outfit = await describe_outfit(crop)
-    if outfit:
-        log.info("outfit: %s", outfit)
-    best, note, tries = None, "", 0
-    for attempt in range(TRYON_ATTEMPTS):
-        tries += 1
-        out = await ai_edit(sent_ai, wig_rgb, build_prompt_pure(p, note, outfit),
-                            keep=face_keep)  # face protected (brows to chin), as when results were good; the hairline stays free
-        out_lm = await landmarks(out)
-        seg_out = None
-        if seg_src is not None:
-            try:
-                seg_out = await segment(out)
-            except Exception:
-                seg_out = None
-        score, why = check_result(crop, lm, out, out_lm, seg_src, seg_out, long_hair=is_long(p))
-        log.info("try-on attempt %d: score %.1f %s", tries, score, why or "(passed)")
-        if best is None or score < best[0]:
-            best = (score, out, seg_out, out_lm, why)
-        if score < 1.0:
-            break
-        note = why
-    score, out, seg_out, out_lm, why = best
-    # Her face stays her face: her own (smoothed) face goes back on the result, and the result's skin
-    # (neck, ears, chest) is first brought to her exact skin colour so there is no edge where they meet.
-    locked = False
-    if SKIN_TONE > 0 and seg_src is not None and seg_out is not None:
-        gap = skin_tone_gap(sent, seg_src, out, seg_out)
-        out = keep_skin_tone(sent, seg_src, out, seg_out, SKIN_TONE, exact=KEEP_FACE)
-        log.info("skin tone kept (was off by L %.1f, colour %.1f)", *(gap or (0, 0)))
-    # The AI's lightly retouched face is used only when it is provably still her face; otherwise hers goes back
-    face_ok = FACE_SOURCE == "ai" and out_lm is not None and "facial features changed" not in why \
-        and "moved or changed size" not in why and "made smaller or bigger" not in why
-    likeness = face_match(sent, lm, out, out_lm) if face_ok else 0.0
-    if face_ok and likeness < FACE_MATCH_MIN:
-        face_ok = False  # features are in place but don't look like hers closely enough
-    if KEEP_FACE and not face_ok:
-        # her real face, with a light smoothing so the result is still retouched
-        mine = sent if FACE_ENHANCE > 0 else beautify(sent, lm, FALLBACK_SMOOTH, style="natural", skin_extra=body)
-        out, locked = face_lock(mine, lm, out, out_lm, bool(p.get("bangs")), enhance=0, relight=0.25)
-        log.info("her own face kept (AI face likeness %.2f): %s", likeness, locked)
-    else:
-        log.info("AI's lightly retouched face used (likeness %.2f)", likeness)
-    # Her clothes stay her clothes, by construction: her real body and clothes from her photo, placed
-    # relative to her face exactly as in her photo, under the new hair; anything the AI invented
-    # outside her body becomes backdrop.
-    if KEEP_CLOTHES and seg_src is not None and seg_out is not None:
-        M = align(lm, out_lm) if out_lm is not None else None
-        if M is None and out_lm is not None:
-            M = align(lm, out_lm, strict=False)
-        if M is not None:
-            # How far the AI moved away from her real body/clothes. Close (most photos): her clothes go
-            # on with invisible seams and no extra AI call. Far (it re-posed her): one AI blend pass.
-            fit = garment_fit(sent, seg_src, out, seg_out, M)
-            needs_blend = fit is not None and fit[2] < BLEND_BELOW
-            # Always her real pose: her arms and hands exactly where they are in her photo. Whatever the AI
-            # drew elsewhere (moved hands, extra arms) becomes backdrop; the blend pass smooths the result.
-            out, how = keep_body(sent, seg_src, out, seg_out, M,
-                                 valid=None if added is None else ~added,
-                                 no_paste=neck_band(out.shape, out_lm) if face_ok else None)
-            how += f", match {fit[2]:.2f}" if fit is not None else ""
-            # Also blend when a visible amount of what the AI drew had to be taken out (that leaves hard
-            # cut-out edges which only the blend pass can make natural)
-            # (only a real re-pose triggers the blend pass; small trimmed edges are fine without it)
-        else:
-            out, how = restore_clothes(crop, seg_src, out, seg_out, None)
-            if CLOTHES_STRICT and not (how.startswith("kept") or how.startswith("no clothes")):
-                raise HTTPException(422, "We couldn't keep your outfit exactly as it is in this photo. Please take a "
-                                         "new photo facing the camera, with your head and shoulders in view.")
-        log.info("her own clothes: %s", how)
-        # One AI retouch over the assembled picture so hair, body and backdrop become one photo (her face
-        # and the inside of her clothes are protected, and both are put back exactly afterwards).
-        if BLEND_PASS and M is not None and needs_blend:
-            out = await blend_pass(out, sent, lm, seg_src, wig_rgb, p, outfit)
-    # Deliver exactly what she gave: the result is put back into HER photo's frame, so her body is the same
-    # size and in the same place as in her photo, and the picture ends where her photo ends (a half photo
-    # gives a half result, the wig running off the edge). Anything the AI drew beyond her frame is dropped.
-    out = await to_her_frame(out, lm, sent, seg_src)
-    # The wig must cover her whole head: if a side or the top is still bare, the AI adds the wig's hair there
-    out = await fill_head_gaps(out, lm, wig_rgb, p)
-    # Never hands she isn't showing: if any are still in the picture, the AI repaints only those areas
-    if seg_src is not None and BLEND_PASS:  # (without the blend pass her own body already covers this)
-        out = await remove_added_hands(out, lm, seg_src, wig_rgb)
-    # Safety net: no floating pieces of clothing or skin left anywhere on the finished picture
-    if seg_src is not None:
-        try:
-            seg_f = await segment(out)
-            if seg_f is not None:
-                out, pieces = tidy_body(out, seg_f)
-                if pieces:
-                    log.info("tidied %d stray piece(s)", pieces)
-                # the backdrop in the exact brand colour (a soft colour shift, hair edges blend into it)
-                out = match_backdrop(out, seg_f, BACKDROP_RGB)
-        except Exception:
-            log.exception("tidy step skipped")
-    # Brand safety gate: a result with someone else's hands or a visibly unfinished wig is never shown
-    if QUALITY_GATE:
-        await final_gate(out, lm, seg_src, p)
-    before = crop
-    if added is not None and added.any():
-        a_ = cv2.GaussianBlur(added.astype(np.float32), (0, 0), 3)[..., None]
-        before = np.clip(crop * (1 - a_) + np.full((OUT_H, OUT_W, 3), BACKDROP_RGB, np.float32) * a_, 0, 255).astype(np.uint8)
-    mode = f"pure ai ({tries} attempt{'s' if tries > 1 else ''}, check score {score:.1f})"
-    log.info("try-on finished: mode=%s", mode)
-    return {"before": before, "after": out, "locked": True, "mode": mode}
-
-
-async def run_tryon(rgb: np.ndarray, p: dict) -> dict:
-    # 1. Find the face and crop a head-and-shoulders portrait at the output aspect ratio.
-    lm = await landmarks(rgb)
-    if lm is None:
-        raise HTTPException(422, "We couldn't find a face in your photo. Please retake it.")
-    # Close selfies: extend the canvas so there's room for the full wig above the head and the shoulders
-    rgb, lm, valid = make_room(rgb, lm, OUT_W / OUT_H, fill=BACKDROP_RGB)
-    x, y, w, h = head_crop(rgb.shape, lm, OUT_W / OUT_H)
-    # INTER_AREA only for shrinking; enlarging with it duplicates pixels into visible blocks
-    crop = cv2.resize(rgb[y:y + h, x:x + w], (OUT_W, OUT_H),
-                      interpolation=cv2.INTER_AREA if w >= OUT_W else cv2.INTER_LANCZOS4)
-    added = cv2.resize(valid[y:y + h, x:x + w], (OUT_W, OUT_H), interpolation=cv2.INTER_NEAREST) == 0
-    lm = (lm - [x, y]) * [OUT_W / w, OUT_H / h]
-    bangs = bool(p.get("bangs"))
-
-    # 2. Ask OpenAI to put the wig on, with the face protected by a mask.
-    wig_path = catalog_store.ROOT / p["image"]
-    if not wig_path.exists():
-        raise HTTPException(500, f"Wig image missing: {p['image']}")
-    wig_rgb = to_rgb(wig_path.read_bytes())
-    if p["id"] not in catalog_store.shapes:
-        catalog_store.shapes[p["id"]] = wig_shape(wig_rgb)
-    # The AI may only edit this fenced area (wig outline on the head + margin, minus the face).
-    zone = hair_zone(crop.shape, lm, catalog_store.shapes[p["id"]], bangs)
-    # Also let the AI repaint all of the customer's own hair, so it can hide it under the wig and
-    # seat the wig flush instead of leaving old hair (or a gap) next to it. The face stays locked.
-    try:
-        seg_src = await segment(crop)
-        if seg_src is not None and added.any():
-            seg_src[added] = 0
-            seg_src[added, 0] = 1  # the added area is not part of her photo: nothing of hers is there
-    except Exception:
-        log.exception("Hair model failed on this photo")
-        seg_src = None
-    if seg_src is not None:
-        own = (old_hair(seg_src, lm) > 0.35).astype(np.uint8)  # her hair, or a wrap/cap/wig she wears
-        g = max(3, int(0.03 * OUT_W))
-        own = cv2.dilate(own, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * g + 1, 2 * g + 1)))
-        zone = np.maximum(zone, own)
-        zone[skin_lock(seg_src, lm, bangs) > 0] = 0  # her real forehead/temples: the wig is built around them
-    if BLEND_MODE == "pure":
-        return await run_pure(crop, lm, wig_rgb, p, seg_src, added, src_scale=w / OUT_W)
-
-    ai_mode = BLEND_MODE == "ai" and seg_src is not None
-    if ai_mode:
-        # The AI may repaint everything (face, hair, background) except her clothes.
-        cl = (clothes_keep(seg_src, lm) > 0.5).astype(np.uint8)
-        e = max(2, int(0.01 * OUT_W))
-        cl = cv2.erode(cl, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * e + 1, 2 * e + 1)))
-        edit_mask, prompt = (cl * 255).astype(np.uint8), build_prompt_ai(p)
-    else:
-        edit_mask, prompt = (zone == 0).astype(np.uint8) * 255, build_prompt(p)
-    kwargs = dict(
-        model=MODEL,
-        image=[("customer.png", encode(crop), "image/png"), ("wig.png", encode(wig_rgb), "image/png")],
-        mask=("mask.png", openai_mask_png(edit_mask), "image/png"),
-        prompt=prompt,
-        size=f"{OUT_W}x{OUT_H}",
-        quality=QUALITY,
-        output_format="png",
-        n=1,
-    )
-    if supports_fidelity(MODEL):
-        kwargs["input_fidelity"] = "high"
-    try:
-        res = await openai_client().images.edit(**kwargs)
-    except APIStatusError as e:
-        log.warning("OpenAI error %s: %s", e.status_code, e.message)
-        msg = ("The AI couldn't process this photo. Try a different one."
-               if e.status_code == 400 else "The AI is busy right now, please try again.")
-        raise HTTPException(502, msg)
-    out = to_rgb(base64.b64decode(res.data[0].b64_json))
-    if out.shape[:2] != (OUT_H, OUT_W):
-        out = cv2.resize(out, (OUT_W, OUT_H), interpolation=cv2.INTER_CUBIC)
-
-    out_lm = await landmarks(out)
-
-    # 3. The result is ALWAYS the customer's own photo. Outside the fenced zone nothing from the AI
-    #    is used at all (no model needed for that). Inside it, the hair model (when available)
-    #    keeps only the new hair, so the clothes under and between the braids are theirs too.
-    seg_out = None
-    try:
-        if seg_src is not None:
-            seg_out = await segment(out)
-        if seg_out is not None and float(seg_out[..., HAIR].max()) < 0.5:
-            seg_src = seg_out = None  # the model found no hair in the AI image
-    except Exception:
-        log.exception("Hair model failed on this image")
-        seg_src = seg_out = None
-    if seg_out is None and not ALLOW_WITHOUT_HAIR_MODEL:
-        raise HTTPException(502, "We couldn't finish this look. Please try again.")
-    out_final, mode = None, ""
-    try:
-        if ai_mode and seg_out is not None:
-            out_final = compose_ai(crop, lm, out, out_lm, seg_src, seg_out, RESULT_BACKGROUND, src_scale=w / OUT_W,
-                                   enhance=FACE_ENHANCE, added=added)
-            mode = "ai blend"
-        if out_final is None:
-            # AI face couldn't be matched to her photo reliably: use her own face with the AI hair
-            out_final = transfer_hair(crop, lm, out, out_lm, zone, seg_src, seg_out, FACE_ENHANCE, RESULT_BACKGROUND,
-                                      src_scale=w / OUT_W)
-            mode = ("photo blend (fallback)" if ai_mode else "fence + hair model") if seg_out is not None else "fence only"
-    except Exception:
-        log.exception("Final composite failed")
-        # Never fall back to the raw AI image (it may have changed the clothes).
-        raise HTTPException(502, "We couldn't finish this look. Please try again.")
-    out, locked = out_final, True
-    log.info("try-on finished: mode=%s", mode)
-    before = crop
-    if added.any():  # the "before" picture shows the clean backdrop where the canvas was extended
-        a_ = cv2.GaussianBlur(added.astype(np.float32), (0, 0), 3)[..., None]
-        before = np.clip(crop * (1 - a_) + np.full((OUT_H, OUT_W, 3), BACKDROP_RGB, np.float32) * a_, 0, 255).astype(np.uint8)
-    return {"before": before, "after": out, "locked": locked, "mode": mode}
-
-
-app.mount("/wigs", StaticFiles(directory=catalog_store.WIGS), name="wigs")
-
-# The React app (frontend/dist, built with `npm run build`). Unknown paths fall back to index.html.
-DIST = ROOT / "frontend" / "dist"
-if DIST.exists():
-    app.mount("/assets", StaticFiles(directory=DIST / "assets"), name="assets")
-
-    @app.get("/{path:path}")
-    def spa(path: str):
-        f = DIST / path
-        if path and f.is_file() and DIST in f.resolve().parents:
-            return FileResponse(f)
-        return FileResponse(DIST / "index.html")
+    if float(((seg[..., OTHERS] + seg[..., CLOTHES]) > 0.5)[band].mean()) > 0.15:
+        return "headwear"
+    high = band & (height > fh + 0.05 * g.height)
+    if high.sum() > 200 and float(((seg[..., FACE_SKIN] + seg[..., BODY_SKIN]) > 0.5)[high].mean()) > 0.35:
+        return "high forehead"
+    return ""
