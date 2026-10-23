@@ -1497,21 +1497,23 @@ def no_new_hands(out: np.ndarray, seg_out: np.ndarray, src_skin_w: np.ndarray,
 
 
 def match_backdrop(out: np.ndarray, seg: np.ndarray, rgb) -> np.ndarray:
-    """Bring the plain backdrop to an exact colour. The AI paints the backdrop close to the asked colour;
-    this shifts it the rest of the way, smoothly (keeping the AI's soft light and shadows), and fades the
-    shift out towards her and the hair so edges stay natural."""
-    bg = seg[..., BG]
-    core = bg > 0.9
-    if core.sum() < 2000:
-        return out
+    """One flat, even backdrop in the exact colour, edge to edge. Every background pixel (the AI's backdrop,
+    the room added around a close selfie, any filled edge) becomes exactly that colour, so there are no
+    bands, frames or patches. Hair and her body are never recoloured: only pixels that are background AND
+    already look like the backdrop change, so strands and soft hair edges keep their own colour."""
     lab = _lab(out)
     target = _lab(np.uint8(rgb).reshape(1, 1, 3))[0, 0]
-    shift = target - np.median(lab[core], axis=0)
     W = out.shape[1]
-    w = cv2.GaussianBlur(np.clip((bg - 0.5) / 0.4, 0, 1).astype(np.float32), (0, 0), max(2.0, 0.004 * W))
-    lab += shift[None, None, :] * w[..., None]
-    return _to_u8(_rgb(lab))
-
+    bg = cv2.GaussianBlur(np.clip((seg[..., BG] - 0.3) / 0.4, 0, 1).astype(np.float32), (0, 0), max(1.5, 0.003 * W))
+    # how much each pixel looks like a pinkish/plain backdrop (any shade the AI or the fill gave it)
+    d = np.sqrt(0.35 * (lab[..., 0] - target[0]) ** 2 + (lab[..., 1] - target[1]) ** 2 + (lab[..., 2] - target[2]) ** 2)
+    like = np.clip((60.0 - d) / 25.0, 0, 1)
+    # a plain grey/white area the AI left (no pink at all) is backdrop too when the segmenter is sure
+    like = np.maximum(like, (seg[..., BG] > 0.95) * (np.hypot(lab[..., 1] - 128, lab[..., 2] - 128) < 12))
+    w = (bg * like).astype(np.float32)[..., None]  # no extra blur: thin strands stay their own colour
+    flat = np.empty_like(lab)
+    flat[:] = target
+    return _to_u8(_rgb(lab * (1 - w) + flat * w))
 
 def added_hands(seg_src: np.ndarray, seg_out: np.ndarray, M: np.ndarray) -> np.ndarray:
     """uint8 mask of hands/arms (skin) in the result that are not in her photo. Her face, neck and any
