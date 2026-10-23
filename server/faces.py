@@ -1200,6 +1200,11 @@ def face_lock(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.n
     f = max(4, int(0.08 * fw))
     region = cv2.erode(region, np.ones((3, 3), np.uint8), iterations=max(1, f // 4))
     alpha = cv2.GaussianBlur(region, (0, 0), sigmaX=f / 2).astype(np.float32) / 255.0
+    # Fade out gently over the forehead (no straight edge where her face meets the AI's forehead/hairline)
+    ys, xs = np.mgrid[0:H, 0:W]
+    height = (xs - g_out.chin[0]) * g_out.up[0] + (ys - g_out.chin[1]) * g_out.up[1]
+    brow = float(((out_lm[BROWS] - g_out.chin) @ g_out.up).max())
+    alpha *= np.clip((brow + 0.03 * g_out.height - height) / (0.22 * g_out.height), 0, 1).astype(np.float32)
     alpha = (alpha * (1 - occluded))[..., None]
 
     blended = warped.astype(np.float32) * alpha + out.astype(np.float32) * (1 - alpha)
