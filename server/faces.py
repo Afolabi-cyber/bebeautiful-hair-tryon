@@ -873,7 +873,7 @@ def make_room(rgb: np.ndarray, lm: np.ndarray, aspect: float = 2 / 3, fill=(226,
     box_h = 3.4 * g.height
     box_w = box_h * aspect
     cx = float(lm[FACE_OVAL][:, 0].mean())
-    top = float(lm[FOREHEAD][1]) - 1.2 * g.height
+    top = float(lm[FOREHEAD][1]) - 0.8 * g.height  # room above the head for the wig, not an empty band
     pt = int(np.ceil(max(0.0, -top)))
     # Never extend below or far to the sides: that is where the AI would have to invent her shoulders,
     # arms and the rest of her clothes. Only room above the head and a little at the sides for the
@@ -903,7 +903,7 @@ def head_crop(shape: tuple[int, int], lm: np.ndarray, aspect: float = 2 / 3) -> 
     box_h = min(box_h, H, W / aspect)
     box_w = box_h * aspect
     cx = float(lm[FACE_OVAL][:, 0].mean())
-    top = float(lm[FOREHEAD][1]) - 1.2 * g.height
+    top = float(lm[FOREHEAD][1]) - 0.8 * g.height  # room above the head for the wig, not an empty band
     x = int(round(np.clip(cx - box_w / 2, 0, W - box_w)))
     y = int(round(np.clip(top, 0, H - box_h)))
     return x, y, int(round(box_w)), int(round(box_h))
@@ -1532,6 +1532,13 @@ def match_backdrop(out: np.ndarray, seg: np.ndarray, rgb) -> np.ndarray:
         x, y, w_, h_, _a = stats[i]
         if x == 0 or y == 0 or x + w_ >= W or y + h_ >= H:
             outside[lab_ == i] = 1
+    # never on or near her face (glasses lenses and their reflections, earrings)
+    near_face = cv2.dilate(((seg[..., FACE_SKIN] > 0.4) | (seg[..., OTHERS] > 0.4)).astype(np.uint8),
+                           np.ones((int(0.05 * W) | 1,) * 2, np.uint8))
+    outside[near_face > 0] = 0
+    # well away from her, every background pixel is backdrop, whatever shade it has (no lines or marks)
+    far = cv2.distanceTransform(outside, cv2.DIST_L2, 5) > 0.03 * W
+    like = np.where(far, 1.0, like)
     outside = cv2.GaussianBlur(outside.astype(np.float32), (0, 0), 1.0)
     w = (bg * like * outside).astype(np.float32)[..., None]  # no extra blur: thin strands keep their colour
     flat = np.empty_like(lab)
@@ -1667,3 +1674,38 @@ def bare_scalp(lm_out: np.ndarray, seg_out: np.ndarray, want_mask: bool = False)
     mask = (crown & skin).astype(np.uint8) if bad else np.zeros((H, W), np.uint8)
     mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(0.06 * g.width) | 1,) * 2))
     return bad, mask
+
+
+def mirror_hair(out: np.ndarray, seg: np.ndarray, lm: np.ndarray, area: np.ndarray) -> np.ndarray:
+    """Cover `area` (bare skin on the head) with the hair at the mirror position across her face's centre
+    line; where the mirror side has no hair either, the nearest hair colour is used. Soft edges."""
+    H, W = out.shape[:2]
+    g = geom(lm)
+    c = lm[FACE_OVAL].mean(axis=0)
+    ux, uy = float(g.up[0]), float(g.up[1])
+    nx, ny = -uy, ux  # across the face
+    ys, xs = np.mgrid[0:H, 0:W].astype(np.float32)
+    d = (xs - c[0]) * nx + (ys - c[1]) * ny
+    mx, my = xs - 2 * d * nx, ys - 2 * d * ny
+    mirrored = cv2.remap(out, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    m_hair = cv2.remap((seg[..., HAIR] > 0.5).astype(np.float32), mx, my, cv2.INTER_LINEAR) > 0.5
+    hair = seg[..., HAIR] > 0.5
+    fill = mirrored.astype(np.float32)
+    need = (area > 0) & ~m_hair
+    if need.any() and hair.any():
+        # no hair on the mirror side either: copy the nearest real hair beside or above the patch
+        ys_, xs_ = np.where(area > 0)
+        bh = int(ys_.max() - ys_.min() + 0.04 * g.height)
+        bw = int(xs_.max() - xs_.min() + 0.04 * g.width)
+        left = need.copy()
+        for dy, dx in ((0, bw), (0, -bw), (bh, 0), (bh, bw), (bh, -bw), (2 * bh, 0)):
+            if not left.any():
+                break
+            src = np.roll(np.roll(out, dy, axis=0), dx, axis=1).astype(np.float32)
+            ok = np.roll(np.roll(hair, dy, axis=0), dx, axis=1) & left
+            fill[ok] = src[ok]
+            left &= ~ok
+        if left.any():  # still nothing: the wig's typical hair colour
+            fill[left] = np.median(out[hair], axis=0)
+    a = cv2.GaussianBlur((area > 0).astype(np.float32), (0, 0), max(1.5, 0.004 * W))[..., None]
+    return np.clip(out * (1 - a) + fill * a, 0, 255).astype(np.uint8)
