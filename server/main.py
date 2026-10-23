@@ -320,7 +320,7 @@ def check_result(crop: np.ndarray, lm: np.ndarray, out: np.ndarray, out_lm, seg_
         why.append("her facial features changed; keep exactly the same eyes, nose, lips and face shape")
     if seg_out is not None:
         # the wig must cover her whole head: hair all around the top and both sides of the face
-        if bare_scalp(lm @ M[:, :2].T + M[:, 2], seg_out):
+        if False:  # (bare-scalp retries removed: they caused patches on the forehead)
             score += 12
             why.append("bare scalp or forehead skin shows on top of her head (a wide part or an uncovered hairline); "
                        "use a thin natural part and cover the whole top of the head down to a normal hairline")
@@ -601,7 +601,7 @@ async def blend_pass(comp: np.ndarray, sent: np.ndarray, lm: np.ndarray, seg_src
         if SKIN_TONE > 0 and seg_src is not None:
             out2 = keep_skin_tone(sent, seg_src, out2, o_seg, SKIN_TONE, exact=KEEP_FACE)
         if KEEP_FACE:
-            out2, _ = face_lock(sent, lm, out2, o_lm, bool(p.get("bangs")), enhance=0, relight=0.0)
+            out2, _ = face_lock(sent, lm, out2, o_lm, bool(p.get("bangs")), enhance=0, relight=0.25)
         if KEEP_CLOTHES:
             out2, how = keep_body(sent, seg_src, out2, o_seg, M2, inset=max(4, int(0.012 * W)))
             log.info("blend pass: her clothes %s", how)
@@ -697,10 +697,6 @@ async def fill_head_gaps(out: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p
                 return out
             her = her_face_on(lm, f_lm)
             miss, area = head_gaps(her, f_seg, want_mask=True, shoulders=is_long(p))
-            bald, top = bare_scalp(her, f_seg, want_mask=True)
-            if bald:
-                miss = (miss + " and " if miss else "") + "top of the head (bare scalp)"
-                area = np.maximum(area, top)
             if not miss or not area.any():
                 return out
             log.info("wig did not cover the %s: adding the wig's hair there (round %d)", miss, round_ + 1)
@@ -720,15 +716,6 @@ async def fill_head_gaps(out: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p
             fixed = await ai_edit(base, wig_rgb, prompt, keep=((1 - area) * 255).astype(np.uint8))
             a = cv2.GaussianBlur(area.astype(np.float32), (0, 0), max(2.0, 0.006 * W))[..., None]
             out = np.clip(out * (1 - a) + fixed * a, 0, 255).astype(np.uint8)
-        # last resort, no AI: any skin still above her hairline takes the hair from the mirrored side
-        f_lm = await landmarks(out)
-        f_seg = await segment(out)
-        if f_lm is not None and f_seg is not None:
-            her = her_face_on(lm, f_lm)
-            bald, top = bare_scalp(her, f_seg, want_mask=True)
-            if bald and top.any():
-                out = mirror_hair(out, f_seg, her, top)
-                log.info("covered the remaining bare scalp with the wig's hair from the other side")
         return out
     except Exception:
         log.exception("head gap fill skipped")
@@ -817,7 +804,7 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
     if KEEP_FACE and not face_ok:
         # her real face, with a light smoothing so the result is still retouched
         mine = sent if FACE_ENHANCE > 0 else beautify(sent, lm, FALLBACK_SMOOTH, style="natural", skin_extra=body)
-        out, locked = face_lock(mine, lm, out, out_lm, bool(p.get("bangs")), enhance=0, relight=0.0)
+        out, locked = face_lock(mine, lm, out, out_lm, bool(p.get("bangs")), enhance=0, relight=0.25)
         log.info("her own face kept (AI face likeness %.2f): %s", likeness, locked)
     else:
         log.info("AI's lightly retouched face used (likeness %.2f)", likeness)
