@@ -24,7 +24,7 @@ import catalog_store
 import db
 from status import STATUS
 from admin import router as admin_router
-from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, keep_body, tidy_body, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
+from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, keep_body, no_new_hands, tidy_body, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -250,12 +250,13 @@ def build_prompt_blend(p: dict, outfit: str = "") -> str:
         "- the wig sits naturally on her head and falls naturally over her shoulders, arms and clothes, with soft, "
         "natural strand edges and soft contact shadows where hair touches her and her clothes;\n"
         "- her hands and arms stay exactly where and how they are in image 1 (same position, same fingers, same "
-        "gesture): do not move, add, remove or re-pose any hand or arm;\n"
+        "gesture): do not move, add, remove or re-pose any hand or arm. Never draw a hand that is not visible in "
+        "image 1, and never draw the same hands twice; hands hidden behind the hair stay hidden;\n"
         "- where hair and hands or arms overlap, it looks physically right;\n"
         "- the outline of her body and clothes against the backdrop is clean and natural: no cut-out edges, halos, "
         "white or grey patches, holes or leftover pieces; any hole or gap in her clothes is filled with the same fabric;\n"
         "- if her arms rest on something that is not in the picture, add a plain surface under them at the bottom "
-        "of the frame, without moving the arms;\n"
+        "of the frame, without moving the arms and without adding hands on it;\n"
         "- one consistent light on her, the hair and the backdrop, keeping her real skin tone.\n"
         + (f"She is wearing: {outfit}. Her clothes must stay exactly that. " if outfit else "")
         + "Plain, seamless, light grey-white studio backdrop. Do not add or change anything else. Photorealistic."
@@ -550,6 +551,11 @@ async def blend_pass(comp: np.ndarray, sent: np.ndarray, lm: np.ndarray, seg_src
         if KEEP_CLOTHES:
             out2, how = keep_body(sent, seg_src, out2, o_seg, M2, inset=max(4, int(0.012 * W)))
             log.info("blend pass: her clothes %s", how)
+            # No hands she isn't showing: skin the AI added where her photo has none is taken out
+            skin_w = cv2.warpAffine(np.ascontiguousarray(seg_src[..., BODY_SKIN]), M2, (W, H))
+            out2, gone = no_new_hands(out2, o_seg, skin_w)
+            if gone:
+                log.info("blend pass: removed %d px of hands/arms the AI added", gone)
         return out2
     except HTTPException:
         log.warning("blend pass failed at the AI; keeping the assembled picture")
