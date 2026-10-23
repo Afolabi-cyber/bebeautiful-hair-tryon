@@ -1728,9 +1728,9 @@ def bare_scalp(lm_out: np.ndarray, seg_out: np.ndarray, want_mask: bool = False,
     skin = (seg_out[..., FACE_SKIN] + seg_out[..., BODY_SKIN]) > 0.5
     if strict:
         bad = float(skin[top].mean()) > 0.12 or int((skin & top).sum()) > 0.02 * g.width * g.height
-    else:  # only a clearly raised hairline (a "bald" look), measured in the middle above her real forehead
-        mid = top & (np.abs(across) < 0.18 * g.width) & (height < fore + 0.25 * g.height)
-        bad = mid.sum() > 200 and float(skin[mid].mean()) > 0.35
+    else:  # an open, tall-looking forehead: skin from her own hairline line upward in the middle of the head
+        mid = (height > fore - 0.04 * g.height) & (height < fore + 0.2 * g.height) & (np.abs(across) < 0.3 * g.width)
+        bad = mid.sum() > 200 and float(skin[mid].mean()) > 0.3
     if not want_mask:
         return bad
     # the skin above a normal hairline, across the whole top of the head (to be covered with hair)
