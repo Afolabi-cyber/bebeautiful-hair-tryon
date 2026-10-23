@@ -58,14 +58,14 @@ KEEP_CLOTHES = os.getenv("KEEP_CLOTHES", "on").lower() not in ("0", "off", "fals
 # on: a result that still shows added hands, a bare part of the head or bare scalp is never shown;
 # the customer is asked for a new photo instead (protects the brand)
 QUALITY_GATE = os.getenv("QUALITY_GATE", "off").lower() not in ("0", "off", "false", "no")
-FACE_SOURCE = os.getenv("FACE_SOURCE", "ai").strip().lower()
+FACE_SOURCE = os.getenv("FACE_SOURCE", "photo").strip().lower()  # photo = the setup that fitted well
 # how closely the AI face's eyes, brows, nose and mouth must look like hers (0..1) to be used
 FACE_MATCH_MIN = float(os.getenv("FACE_MATCH_MIN", "0.55"))
 # light smoothing of her real face when it is used instead of the AI's (FACE_ENHANCE 0)
 FALLBACK_SMOOTH = float(os.getenv("FALLBACK_SMOOTH", "0.6"))
 KEEP_FACE = os.getenv("KEEP_FACE", "on").lower() not in ("0", "off", "false", "no")
 SKIN_TONE = max(0.0, min(1.0, float(os.getenv("SKIN_TONE", "1"))))
-TRYON_ATTEMPTS = max(1, min(3, int(os.getenv("TRYON_ATTEMPTS", "1"))))
+TRYON_ATTEMPTS = max(1, min(3, int(os.getenv("TRYON_ATTEMPTS", "2"))))
 FACE_ENHANCE = min(1.0, max(0.0, float(os.getenv("FACE_ENHANCE", "0"))))  # retouch strength: 0 = off, 0.75 = default, 1 = strongest
 OUT_W, OUT_H = 1024, 1536
 MAX_UPLOAD = 15 * 1024 * 1024
@@ -227,6 +227,9 @@ def build_prompt_pure(p: dict, retry_note: str = "", outfit: str = "") -> str:
         "lighting. Do not re-imagine, re-pose or re-shoot her. The result must look like a real photograph, never like "
         "a collage.\n\n"
         "THE PARTING: a thin, natural centre part in the middle of the head, the hair falling evenly to both sides.\n\n"
+        "THE HAIRLINE: her forehead must look exactly as tall as in image 1. The wig's front hairline starts right where "
+        "her own hairline (or her headband, scarf or cap) is in image 1, never higher, so she never looks bald or as if "
+        "her forehead grew.\n\n"
         "THE WIG: reproduce image 2 faithfully: the same braid size and pattern, curl type and where the curls "
         "start, the same colours and ombre in the same places, the same length, density and fullness. Do not invent a "
         "different style. Fit it like a professionally installed wig: flush and snug on the scalp, the top close to the "
@@ -320,7 +323,7 @@ def check_result(crop: np.ndarray, lm: np.ndarray, out: np.ndarray, out_lm, seg_
         why.append("her facial features changed; keep exactly the same eyes, nose, lips and face shape")
     if seg_out is not None:
         # the wig must cover her whole head: hair all around the top and both sides of the face
-        if False:  # (bare-scalp retries removed: they caused patches on the forehead)
+        if bare_scalp(lm @ M[:, :2].T + M[:, 2], seg_out, strict=False):  # hairline far too high: one retry
             score += 12
             why.append("bare scalp or forehead skin shows on top of her head (a wide part or an uncovered hairline); "
                        "use a thin natural part and cover the whole top of the head down to a normal hairline")
