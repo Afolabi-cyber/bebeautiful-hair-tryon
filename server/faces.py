@@ -1568,9 +1568,10 @@ def added_hands(seg_src: np.ndarray, seg_out: np.ndarray, M: np.ndarray) -> np.n
     """uint8 mask of hands/arms (skin) in the result that are not in her photo. Her face, neck and any
     skin she shows are excluded (with a margin), hair over skin is ignored, specks are ignored."""
     H, W = seg_out.shape[:2]
-    her = np.clip(seg_src[..., BODY_SKIN] + seg_src[..., FACE_SKIN], 0, 1).astype(np.float32)
-    her = cv2.warpAffine(np.ascontiguousarray(her), M, (W, H)) > 0.3
-    her = cv2.dilate(her.astype(np.uint8), np.ones((int(0.04 * W) | 1,) * 2, np.uint8))
+    # only her own BODY skin (neck, arms, hands she shows) counts as hers: a hand drawn on or beside her face is
+    # body skin where her photo has face skin or hair, so it is caught (before, the face margin hid it)
+    her = cv2.warpAffine(np.ascontiguousarray(seg_src[..., BODY_SKIN].astype(np.float32)), M, (W, H)) > 0.3
+    her = cv2.dilate(her.astype(np.uint8), np.ones((int(0.02 * W) | 1,) * 2, np.uint8))
     new = ((seg_out[..., BODY_SKIN] > 0.5) & (her == 0) & (seg_out[..., HAIR] < 0.35)).astype(np.uint8)
     new = cv2.morphologyEx(new, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     n, lab_, stats, _ = cv2.connectedComponentsWithStats(new, connectivity=8)
