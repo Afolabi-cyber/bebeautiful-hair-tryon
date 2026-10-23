@@ -24,7 +24,7 @@ import catalog_store
 import db
 from status import STATUS
 from admin import router as admin_router
-from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, added_hands, bare_scalp, face_match, head_gaps, neck_band, keep_body, match_backdrop, no_new_hands, tidy_body, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
+from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, added_hands, bare_scalp, mirror_hair, face_match, head_gaps, neck_band, keep_body, match_backdrop, no_new_hands, tidy_body, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -226,14 +226,7 @@ def build_prompt_pure(p: dict, retry_note: str = "", outfit: str = "") -> str:
         "her face, her body, her pose, her hands and arms, her clothes and jewellery, their position, size and "
         "lighting. Do not re-imagine, re-pose or re-shoot her. The result must look like a real photograph, never like "
         "a collage.\n\n"
-        "THE PARTING: the hair is parted in the middle of the head: a THIN, natural centre part line from the hairline "
-        "to the crown, only a hair's width of scalp showing, with the braids starting right at the part on each side and "
-        "the hair falling evenly to both sides (even if image 2 shows a side part). Never a wide bare strip, never bare "
-        "scalp or forehead skin above the hairline: the whole top of the head is covered by the wig up to a natural, "
-        "normal-height hairline (cover a high or receding hairline). The hairline sits right at the top of her "
-        "forehead, flat and natural: no bump, bulge, raised patch, lace, cap, skin-coloured area or extra forehead on "
-        "top of the head. If a headband, scarf, cap or anything else covers part of her forehead or hair in image 1, "
-        "the wig's hairline goes where her natural hairline is: never draw extra forehead skin where it was.\n\n"
+        "THE PARTING: a thin, natural centre part in the middle of the head, the hair falling evenly to both sides.\n\n"
         "THE WIG: reproduce image 2 faithfully: the same braid size and pattern, curl type and where the curls "
         "start, the same colours and ombre in the same places, the same length, density and fullness. Do not invent a "
         "different style. Fit it like a professionally installed wig: flush and snug on the scalp, the top close to the "
@@ -690,32 +683,53 @@ def her_face_on(lm: np.ndarray, f_lm: np.ndarray) -> np.ndarray:
 
 
 async def fill_head_gaps(out: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dict) -> np.ndarray:
+    """Bare parts of the head (a side, the top, a shoulder, a bump of skin above her hairline) get the wig's hair.
+    1. the AI repaints those areas (twice at most), starting from hair colour so it can't keep the skin;
+    2. if any bare skin is still above her hairline, it is covered with the wig's own hair mirrored from the
+       other side of the centre part (the braids are symmetric), so a bump can never stay."""
     try:
+        W = out.shape[1]
+        desc = p.get("description") or p["name"]
+        for round_ in range(2):
+            f_lm = await landmarks(out)
+            f_seg = await segment(out)
+            if f_lm is None or f_seg is None:
+                return out
+            her = her_face_on(lm, f_lm)
+            miss, area = head_gaps(her, f_seg, want_mask=True, shoulders=is_long(p))
+            bald, top = bare_scalp(her, f_seg, want_mask=True)
+            if bald:
+                miss = (miss + " and " if miss else "") + "top of the head (bare scalp)"
+                area = np.maximum(area, top)
+            if not miss or not area.any():
+                return out
+            log.info("wig did not cover the %s: adding the wig's hair there (round %d)", miss, round_ + 1)
+            # start the area from the wig's hair colour, so the AI paints hair there, not skin again
+            hair_px = out[(f_seg[..., HAIR] > 0.6) & (area == 0)]
+            base = out.copy()
+            if len(hair_px) > 500:
+                base[area > 0] = np.median(hair_px, axis=0).astype(np.uint8)
+            prompt = ("Image 2 is the wig she is wearing (" + desc + "). The editable area is part of her head that the "
+                      "wig must cover: paint the same wig hair there so the wig covers her whole head like a real, "
+                      "properly installed wig: the same braids, colours and style, a thin natural centre part, braids "
+                      "lying flat on the scalp from the part, covering the top of the head down to a natural hairline "
+                      "at the top of her forehead, covering the ears and falling over BOTH shoulders, joined seamlessly "
+                      "to the hair around it. No skin, scalp, bump, lace or background in that area. Do not change her "
+                      "face, clothes or anything outside the editable area. Keep the plain " + BACKDROP_WORDS +
+                      " backdrop. Photorealistic.")
+            fixed = await ai_edit(base, wig_rgb, prompt, keep=((1 - area) * 255).astype(np.uint8))
+            a = cv2.GaussianBlur(area.astype(np.float32), (0, 0), max(2.0, 0.006 * W))[..., None]
+            out = np.clip(out * (1 - a) + fixed * a, 0, 255).astype(np.uint8)
+        # last resort, no AI: any skin still above her hairline takes the hair from the mirrored side
         f_lm = await landmarks(out)
         f_seg = await segment(out)
-        if f_lm is None or f_seg is None:
-            return out
-        her = her_face_on(lm, f_lm)
-        miss, area = head_gaps(her, f_seg, want_mask=True, shoulders=is_long(p))
-        bald, top = bare_scalp(her, f_seg, want_mask=True)
-        if bald:
-            miss = (miss + " and " if miss else "") + "top of the head (bare scalp)"
-            area = np.maximum(area, top)
-        if not miss or not area.any():
-            return out
-        log.info("wig did not cover the %s: adding the wig's hair there", miss)
-        desc = p.get("description") or p["name"]
-        prompt = ("Image 2 is the wig she is wearing (" + desc + "). In the editable area beside her head, add the same "
-                  "wig hair so the wig covers her whole head like a real, properly installed wig: the same braids, "
-                  "colours and style, parted in the middle, lying flat on the scalp from the centre part, falling over "
-                  "BOTH shoulders, covering the ear and falling down "
-                  "naturally, joined seamlessly to the hair that is already there. No bare scalp, gap or background "
-                  "around her head. Do not change her face, skin, clothes or anything outside the editable area. "
-                  "Keep the plain " + BACKDROP_WORDS + " backdrop. Photorealistic.")
-        fixed = await ai_edit(out, wig_rgb, prompt, keep=((1 - area) * 255).astype(np.uint8))
-        W = out.shape[1]
-        a = cv2.GaussianBlur(area.astype(np.float32), (0, 0), max(2.0, 0.006 * W))[..., None]
-        return np.clip(out * (1 - a) + fixed * a, 0, 255).astype(np.uint8)
+        if f_lm is not None and f_seg is not None:
+            her = her_face_on(lm, f_lm)
+            bald, top = bare_scalp(her, f_seg, want_mask=True)
+            if bald and top.any():
+                out = mirror_hair(out, f_seg, her, top)
+                log.info("covered the remaining bare scalp with the wig's hair from the other side")
+        return out
     except Exception:
         log.exception("head gap fill skipped")
         return out
@@ -771,7 +785,7 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
     for attempt in range(TRYON_ATTEMPTS):
         tries += 1
         out = await ai_edit(sent, wig_rgb, build_prompt_pure(p, note, outfit),
-                            keep=None if FACE_SOURCE == "ai" else face_keep)  # ai: the face may be retouched
+                            keep=face_keep)  # face protected (brows to chin), as when results were good; the hairline stays free
         out_lm = await landmarks(out)
         seg_out = None
         if seg_src is not None:
