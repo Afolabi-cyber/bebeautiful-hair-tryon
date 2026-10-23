@@ -1555,7 +1555,7 @@ def added_hands(seg_src: np.ndarray, seg_out: np.ndarray, M: np.ndarray) -> np.n
     return out
 
 
-def head_gaps(lm_out: np.ndarray, seg_out: np.ndarray, want_mask: bool = False):
+def head_gaps(lm_out: np.ndarray, seg_out: np.ndarray, want_mask: bool = False, shoulders: bool = True):
     """Where the wig fails to cover her head: checks a band around the top and sides of her face (forehead
     line up to the crown, temples, beside the ears) for hair. Returns "" or e.g. "left side ...";
     with want_mask=True returns (text, uint8 mask of the bare parts of that band, widened outward)."""
@@ -1584,7 +1584,7 @@ def head_gaps(lm_out: np.ndarray, seg_out: np.ndarray, want_mask: bool = False):
             mask |= (r & ~hair).astype(np.uint8)
     # hair over BOTH shoulders: beside the neck, from the chin down, on each side of the face
     below = (height < 0.05 * g.height) & (height > -0.7 * g.height)
-    for name, sel in (("left shoulder (as seen in the picture)", (side < -0.55 * g.width) & (side > -1.15 * g.width)),
+    for name, sel in () if not shoulders else (("left shoulder (as seen in the picture)", (side < -0.55 * g.width) & (side > -1.15 * g.width)),
                       ("right shoulder (as seen in the picture)", (side > 0.55 * g.width) & (side < 1.15 * g.width))):
         r = below & sel
         if r.sum() > 400 and hair[r].mean() < 0.3:
@@ -1641,3 +1641,27 @@ def neck_band(shape, lm: np.ndarray) -> np.ndarray:
     height = (xs - g.chin[0]) * g.up[0] + (ys - g.chin[1]) * g.up[1]
     across = -(xs - g.chin[0]) * g.up[1] + (ys - g.chin[1]) * g.up[0]
     return ((height < 0.15 * g.height) & (height > -0.45 * g.height) & (np.abs(across) < 0.7 * g.width)).astype(np.uint8)
+
+
+def bare_scalp(lm_out: np.ndarray, seg_out: np.ndarray, want_mask: bool = False):
+    """True when skin shows on top of the head above the hairline (a wide bare part or an uncovered high
+    forehead): the strip from a normal hairline up to the crown, around the middle of the head."""
+    H, W = seg_out.shape[:2]
+    g = geom(lm_out)
+    c = lm_out[FACE_OVAL].mean(axis=0)
+    ys, xs = np.mgrid[0:H, 0:W]
+    height = (xs - g.chin[0]) * g.up[0] + (ys - g.chin[1]) * g.up[1]
+    across = -(xs - c[0]) * g.up[1] + (ys - c[1]) * g.up[0]
+    brow = float(((lm_out[BROWS] - g.chin) @ g.up).max())
+    top = (height > brow + 0.28 * g.height) & (height < brow + 0.6 * g.height) & (np.abs(across) < 0.22 * g.width)
+    if top.sum() < 300:
+        return False
+    skin = (seg_out[..., FACE_SKIN] + seg_out[..., BODY_SKIN]) > 0.5
+    bad = float(skin[top].mean()) > 0.3
+    if not want_mask:
+        return bad
+    # the skin above a normal hairline, across the whole top of the head (to be covered with hair)
+    crown = (height > brow + 0.22 * g.height) & (np.abs(across) < 0.6 * g.width)
+    mask = (crown & skin).astype(np.uint8) if bad else np.zeros((H, W), np.uint8)
+    mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(0.06 * g.width) | 1,) * 2))
+    return bad, mask
