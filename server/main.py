@@ -24,7 +24,7 @@ import catalog_store
 import db
 from status import STATUS
 from admin import router as admin_router
-from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, added_hands, bare_scalp, covered_hairline, hair_hint, face_match, head_gaps, neck_band, keep_body, match_backdrop, no_new_hands, tidy_body, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
+from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, added_hands, lower_hairline, match_forehead, bare_scalp, covered_hairline, hair_hint, face_match, head_gaps, neck_band, keep_body, match_backdrop, no_new_hands, tidy_body, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -57,6 +57,8 @@ KEEP_CLOTHES = os.getenv("KEEP_CLOTHES", "on").lower() not in ("0", "off", "fals
 # (same features, same face shape); otherwise her real face goes back. "photo": always her real face.
 # on: the AI does everything and its picture is returned as is (tested: it changes face and clothes). Default off.
 AI_ONLY = os.getenv("AI_ONLY", "off").lower() not in ("0", "off", "false", "no")
+HEADWEAR_CHECK = os.getenv("HEADWEAR_CHECK", "on").lower() not in ("0", "off", "false", "no")
+LOWER_HAIRLINE = os.getenv("LOWER_HAIRLINE", "off").lower() not in ("0", "off", "false", "no")
 HAIRLINE_HINT = os.getenv("HAIRLINE_HINT", "on").lower() not in ("0", "off", "false", "no")
 FACE_SOURCE = os.getenv("FACE_SOURCE", "ai").strip().lower()
 # how closely the AI face's eyes, brows, nose and mouth must look like hers (0..1) to be used
@@ -540,6 +542,18 @@ async def create_session(
     problem = photo_problem(rgb.shape, lm0, blink)
     if problem:
         raise HTTPException(422, problem)
+    # A headband, scarf or cap hides her hairline, and the AI then shows bare forehead under the wig (the "bump").
+    # Ask for the photo without it, before anything is made (the only photos this affects).
+    if HEADWEAR_CHECK:
+        try:
+            seg = await segment(rgb)
+            if seg is not None and covered_hairline(lm0, seg) == "headwear":
+                raise HTTPException(422, "Please remove your headband, scarf or cap so your hairline shows, "
+                                         "then take your photo again.")
+        except HTTPException:
+            raise
+        except Exception:
+            log.exception("headwear check skipped")
 
     photo = db.save_photo(encode(rgb, ".jpg", 94))
     sid = db.create_session(name, phone or None, email or None, True, photo,
@@ -713,6 +727,12 @@ async def to_her_frame(out: np.ndarray, lm: np.ndarray, sent: np.ndarray, seg_sr
         return out
 
 
+def her_face_on(lm: np.ndarray, f_lm: np.ndarray) -> np.ndarray:
+    """Her real face outline from her photo, placed on the result (lined up on eyes, nose, mouth)."""
+    M = align(lm, f_lm, strict=False)
+    return f_lm if M is None else (lm @ M[:, :2].T + M[:, 2]).astype(np.float32)
+
+
 async def fill_head_gaps(out: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dict) -> np.ndarray:
     try:
         f_lm = await landmarks(out)
@@ -869,6 +889,8 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
         mine = sent if FACE_ENHANCE > 0 else beautify(sent, lm, FALLBACK_SMOOTH, style="natural", skin_extra=body)
         out, locked = face_lock(mine, lm, out, out_lm, bool(p.get("bangs")), enhance=0, relight=0.0)
         log.info("her own face kept (AI face likeness %.2f): %s", likeness, locked)
+        if seg_out is not None:  # one skin tone from chin to hairline: no lighter "bald" block above the brows
+            out = match_forehead(out, seg_out, out_lm)
     else:
         log.info("AI's lightly retouched face used (likeness %.2f)", likeness)
     # Her clothes stay her clothes, by construction: her real body and clothes from her photo, placed
@@ -911,6 +933,17 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
     # Never hands she isn't showing: if any are still in the picture, the AI repaints only those areas
     if seg_src is not None and BLEND_PASS:  # (without the blend pass her own body already covers this)
         out = await remove_added_hands(out, lm, seg_src, wig_rgb)
+    # No bump, no open forehead: if the wig's hairline sits above hers, the wig is slid down onto the forehead
+    if LOWER_HAIRLINE and seg_src is not None:
+        try:
+            f_lm = await landmarks(out)
+            f_seg = await segment(out)
+            if f_lm is not None and f_seg is not None:
+                out, moved = lower_hairline(out, f_seg, her_face_on(lm, f_lm))
+                if moved:
+                    log.info("wig slid down onto the forehead by %.0f%% of face height", moved * 100)
+        except Exception:
+            log.exception("hairline step skipped")
     # Safety net: no floating pieces of clothing or skin left anywhere on the finished picture
     if seg_src is not None:
         try:
