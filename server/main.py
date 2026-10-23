@@ -945,8 +945,9 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
     # flagged gets fixed from her photo (every paste is a possible seam, so none is done without a reason).
     # With OpenAI (which redraws everything) all the protections run as before.
     gem = _made_by.get() == "gemini"
-    fix_face = (not gem) or out_lm is None or "face" in why or "skin was made" in why
-    fix_clothes = (not gem) or "clothes" in why or "pose or body" in why
+    new_hands = "hands or arms were added" in why
+    fix_face = (not gem) or out_lm is None or "face" in why or "skin was made" in why or new_hands
+    fix_clothes = (not gem) or "clothes" in why or "pose or body" in why or new_hands
     fix_frame = (not gem) or "smaller or bigger" in why or "moved" in why
     if gem:
         log.info("picture by Gemini; fixing: %s", ", ".join(n for n, f in (("face", fix_face), ("clothes", fix_clothes),
@@ -1010,6 +1011,13 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
                 raise HTTPException(422, "We couldn't keep your outfit exactly as it is in this photo. Please take a "
                                          "new photo facing the camera, with your head and shoulders in view.")
         log.info("her own clothes: %s", how)
+        if new_hands and M is not None:  # a hand the AI drew that is not in her photo: taken out
+            skin_w = cv2.warpAffine(np.ascontiguousarray(seg_src[..., BODY_SKIN]), M, (OUT_W, OUT_H))
+            inside = cv2.warpAffine(np.ones(seg_src.shape[:2], np.float32), M, (OUT_W, OUT_H)) > 0.99
+            seg_now = await segment(out)
+            if seg_now is not None:
+                out, gone = no_new_hands(out, seg_now, skin_w, inside)
+                log.info("removed %d px of hands the AI added", gone)
         # One AI retouch over the assembled picture so hair, body and backdrop become one photo (her face
         # and the inside of her clothes are protected, and both are put back exactly afterwards).
         if BLEND_PASS and M is not None and needs_blend:
