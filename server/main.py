@@ -24,7 +24,7 @@ import catalog_store
 import db
 from status import STATUS
 from admin import router as admin_router
-from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, added_hands, face_match, head_gaps, neck_band, keep_body, match_backdrop, no_new_hands, tidy_body, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
+from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, added_hands, bare_scalp, face_match, head_gaps, neck_band, keep_body, match_backdrop, no_new_hands, tidy_body, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -55,6 +55,9 @@ CLOTHES_STRICT = os.getenv("CLOTHES_STRICT", "on").lower() not in ("0", "off", "
 KEEP_CLOTHES = os.getenv("KEEP_CLOTHES", "on").lower() not in ("0", "off", "false", "no")
 # "ai": the AI does a very light skin retouch and its face is used, but only if the identity check passed
 # (same features, same face shape); otherwise her real face goes back. "photo": always her real face.
+# on: a result that still shows added hands, a bare part of the head or bare scalp is never shown;
+# the customer is asked for a new photo instead (protects the brand)
+QUALITY_GATE = os.getenv("QUALITY_GATE", "on").lower() not in ("0", "off", "false", "no")
 FACE_SOURCE = os.getenv("FACE_SOURCE", "ai").strip().lower()
 # how closely the AI face's eyes, brows, nose and mouth must look like hers (0..1) to be used
 FACE_MATCH_MIN = float(os.getenv("FACE_MATCH_MIN", "0.55"))
@@ -292,7 +295,14 @@ def build_prompt_blend(p: dict, outfit: str = "") -> str:
     )
 
 
-def check_result(crop: np.ndarray, lm: np.ndarray, out: np.ndarray, out_lm, seg_src, seg_out) -> tuple[float, str]:
+def is_long(p: dict) -> bool:
+    """Shoulder-length or longer (the hair must fall on both shoulders); short styles are not held to that."""
+    t = f"{p.get('name', '')} {p.get('description', '')}".lower()
+    return not any(w in t for w in ("bob", "pixie", "short", "chin length", "chin-length", "tapered", "afro puff"))
+
+
+def check_result(crop: np.ndarray, lm: np.ndarray, out: np.ndarray, out_lm, seg_src, seg_out,
+                 long_hair: bool = True) -> tuple[float, str]:
     """How good an AI result is (0 = perfect, higher = worse) and what went wrong, for a retry.
     Checks only; the picture itself is never edited."""
     if out_lm is None:
@@ -314,7 +324,11 @@ def check_result(crop: np.ndarray, lm: np.ndarray, out: np.ndarray, out_lm, seg_
         why.append("her facial features changed; keep exactly the same eyes, nose, lips and face shape")
     if seg_out is not None:
         # the wig must cover her whole head: hair all around the top and both sides of the face
-        miss = head_gaps(lm @ M[:, :2].T + M[:, 2], seg_out)
+        if bare_scalp(out_lm, seg_out):
+            score += 12
+            why.append("bare scalp or forehead skin shows on top of her head (a wide part or an uncovered hairline); "
+                       "use a thin natural part and cover the whole top of the head down to a normal hairline")
+        miss = head_gaps(lm @ M[:, :2].T + M[:, 2], seg_out, shoulders=long_hair)
         if miss:
             score += 12
             why.append(f"the wig does not cover the {miss} of her head (bare scalp or background shows there); the wig "
@@ -610,6 +624,29 @@ async def blend_pass(comp: np.ndarray, sent: np.ndarray, lm: np.ndarray, seg_src
         return comp
 
 
+async def final_gate(out: np.ndarray, lm: np.ndarray, seg_src, p: dict) -> None:
+    try:
+        f_lm = await landmarks(out)
+        f_seg = await segment(out)
+    except Exception:
+        return
+    if f_lm is None or f_seg is None:
+        return
+    problems = []
+    M = align(lm, f_lm, strict=False)
+    if seg_src is not None and M is not None and added_hands(seg_src, f_seg, M).any():
+        problems.append("hands")
+    if head_gaps(f_lm, f_seg, shoulders=False):  # the head itself must be covered (shoulders may vary)
+        problems.append("head not covered")
+    if bare_scalp(f_lm, f_seg):
+        problems.append("bare scalp")
+    if problems:
+        log.warning("quality gate stopped this result: %s", ", ".join(problems))
+        raise HTTPException(422, "We couldn't get a perfect result from this photo. Please take a new photo facing the "
+                                 "camera in good light, with your head and shoulders in view and nothing in front of "
+                                 "your face, and try again.")
+
+
 async def to_her_frame(out: np.ndarray, lm: np.ndarray, sent: np.ndarray, seg_src) -> np.ndarray:
     try:
         f_lm = await landmarks(out)
@@ -647,7 +684,11 @@ async def fill_head_gaps(out: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p
         f_seg = await segment(out)
         if f_lm is None or f_seg is None:
             return out
-        miss, area = head_gaps(f_lm, f_seg, want_mask=True)
+        miss, area = head_gaps(f_lm, f_seg, want_mask=True, shoulders=is_long(p))
+        bald, top = bare_scalp(f_lm, f_seg, want_mask=True)
+        if bald:
+            miss = (miss + " and " if miss else "") + "top of the head (bare scalp)"
+            area = np.maximum(area, top)
         if not miss or not area.any():
             return out
         log.info("wig did not cover the %s: adding the wig's hair there", miss)
@@ -726,7 +767,7 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
                 seg_out = await segment(out)
             except Exception:
                 seg_out = None
-        score, why = check_result(crop, lm, out, out_lm, seg_src, seg_out)
+        score, why = check_result(crop, lm, out, out_lm, seg_src, seg_out, long_hair=is_long(p))
         log.info("try-on attempt %d: score %.1f %s", tries, score, why or "(passed)")
         if best is None or score < best[0]:
             best = (score, out, seg_out, out_lm, why)
@@ -806,6 +847,9 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
                 out = match_backdrop(out, seg_f, BACKDROP_RGB)
         except Exception:
             log.exception("tidy step skipped")
+    # Brand safety gate: a result with someone else's hands or a visibly unfinished wig is never shown
+    if QUALITY_GATE:
+        await final_gate(out, lm, seg_src, p)
     before = crop
     if added is not None and added.any():
         a_ = cv2.GaussianBlur(added.astype(np.float32), (0, 0), 3)[..., None]
