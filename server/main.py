@@ -216,6 +216,16 @@ def build_prompt_ai(p: dict) -> str:
     )
 
 
+UNCOVER_PROMPT = (
+    "Edit this photo: remove anything she wears on her head (headband, scarf, head wrap, cap, hat, bonnet) and show "
+    "her own natural hair underneath, exactly as it would really look: her own hair colour and texture, her natural "
+    "hairline at a normal height at the top of her forehead, hair covering the top and sides of her head. If her "
+    "forehead looks very high or her hairline is bare, show her natural hair down to a normal hairline. Never show "
+    "bare scalp or extra forehead skin. Do not change her face, eyes, eyebrows, skin, skin tone, expression, glasses, "
+    "jewellery, clothes, body, pose, framing or the background. Photorealistic, the same photo."
+)
+
+
 def build_prompt_ai_only(p: dict, retry_note: str = "") -> str:
     """Everything learnt from the tests, in one instruction. The AI does the whole job; nothing is pasted after."""
     desc = p.get("description") or p["name"]
@@ -591,11 +601,14 @@ async def describe_outfit(crop: np.ndarray) -> str:
         return ""
 
 
-async def ai_edit(crop: np.ndarray, wig_rgb: np.ndarray, prompt: str, keep: np.ndarray | None = None,
+async def ai_edit(crop: np.ndarray, wig_rgb: np.ndarray | None, prompt: str, keep: np.ndarray | None = None,
                   quality: str | None = None) -> np.ndarray:
+    images = [("customer.png", encode(crop), "image/png")]
+    if wig_rgb is not None:
+        images.append(("wig.png", encode(wig_rgb), "image/png"))
     kwargs = dict(
         model=MODEL,
-        image=[("customer.png", encode(crop), "image/png"), ("wig.png", encode(wig_rgb), "image/png")],
+        image=images,
         prompt=prompt,
         size=f"{OUT_W}x{OUT_H}",
         quality=quality or QUALITY,
@@ -801,8 +814,13 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
     sent_ai = sent
     why_hint = covered_hairline(lm, seg_src) if (seg_src is not None and HAIRLINE_HINT) else ""
     if why_hint:
-        sent_ai = hair_hint(sent, lm, wig_rgb, seg_src)
-        log.info("hairline hint given to the AI (%s)", why_hint)
+        # Step 1 (AI): uncover her own hair and hairline, so the wig step starts from a visible hairline
+        try:
+            sent_ai = await ai_edit(sent, None, UNCOVER_PROMPT, keep=keep_mask(sent.shape, lm, shrink=0.92))
+            log.info("headwear/hairline: AI first uncovered her natural hairline (%s)", why_hint)
+        except Exception:
+            sent_ai = hair_hint(sent, lm, wig_rgb, seg_src)
+            log.info("hairline hint given to the AI (%s)", why_hint)
     outfit = await describe_outfit(crop)
     if outfit:
         log.info("outfit: %s", outfit)
