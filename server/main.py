@@ -627,7 +627,8 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
             needs_blend = fit is not None and fit[2] < BLEND_BELOW
             # Always her real pose: her arms and hands exactly where they are in her photo. Whatever the AI
             # drew elsewhere (moved hands, extra arms) becomes backdrop; the blend pass smooths the result.
-            out, how = keep_body(sent, seg_src, out, seg_out, M)
+            out, how = keep_body(sent, seg_src, out, seg_out, M,
+                                 valid=None if added is None else ~added)
             how += f", match {fit[2]:.2f}" if fit is not None else ""
             # Also blend when a visible amount of what the AI drew had to be taken out (that leaves hard
             # cut-out edges which only the blend pass can make natural)
