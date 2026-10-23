@@ -1439,6 +1439,8 @@ def tidy_body(out: np.ndarray, seg: np.ndarray) -> tuple[np.ndarray, int]:
     H, W = out.shape[:2]
     person = np.clip(seg[..., CLOTHES] + seg[..., BODY_SKIN] + seg[..., FACE_SKIN] + seg[..., HAIR]
                      + seg[..., OTHERS], 0, 1) > 0.5
+    # jewellery and glasses (earrings, necklaces) are hers even when they float apart: never removed
+    keep_alone = seg[..., OTHERS] > 0.3
     n, lab_, stats, _ = cv2.connectedComponentsWithStats(person.astype(np.uint8), connectivity=8)
     if n <= 2:
         return out, 0
@@ -1449,6 +1451,10 @@ def tidy_body(out: np.ndarray, seg: np.ndarray) -> tuple[np.ndarray, int]:
         if i != main and stats[i][4] < 0.015 * H * W:  # specks and slivers, never a real part of the picture
             stray[lab_ == i] = 1
     stray &= ((seg[..., HAIR] < 0.35)).astype(np.uint8)  # loose curls are allowed to float
+    stray &= (~keep_alone).astype(np.uint8)
+    # nothing near her face is ever a stray piece (earrings, fingers, collar points)
+    face = cv2.dilate((seg[..., FACE_SKIN] > 0.5).astype(np.uint8), np.ones((int(0.12 * W) | 1,) * 2, np.uint8))
+    stray &= (1 - face).astype(np.uint8)
     if not stray.any():
         return out, 0
     bgm = cv2.erode((seg[..., BG] > 0.7).astype(np.uint8), np.ones((7, 7), np.uint8)).astype(np.float32)
