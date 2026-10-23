@@ -8,6 +8,7 @@ import logging
 import re
 import os
 import time
+from contextvars import ContextVar
 from collections import OrderedDict, defaultdict, deque
 from pathlib import Path
 
@@ -61,6 +62,7 @@ KEEP_CLOTHES = os.getenv("KEEP_CLOTHES", "on").lower() not in ("0", "off", "fals
 IMAGE_PROVIDER = os.getenv("IMAGE_PROVIDER", "gemini" if os.getenv("GEMINI_API_KEY") else "openai").strip().lower()
 GEMINI_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-nano-banana-2.1")
 GEMINI_SIZE = os.getenv("GEMINI_IMAGE_SIZE", "1K")
+_made_by: ContextVar[str] = ContextVar("made_by", default="openai")  # which AI made the last picture (this request)
 AI_ONLY = os.getenv("AI_ONLY", "off").lower() not in ("0", "off", "false", "no")
 HEADWEAR_CHECK = os.getenv("HEADWEAR_CHECK", "on").lower() not in ("0", "off", "false", "no")
 LOWER_HAIRLINE = os.getenv("LOWER_HAIRLINE", "off").lower() not in ("0", "off", "false", "no")
@@ -414,7 +416,7 @@ def check_result(crop: np.ndarray, lm: np.ndarray, out: np.ndarray, out_lm, seg_
         hair_o = cv2.warpAffine(np.ascontiguousarray(seg_out[..., HAIR]), Minv, (W, H)) > 0.3
         cl &= ~cv2.dilate(hair_o.astype(np.uint8), np.ones((9, 9), np.uint8)).astype(bool)
         # (with KEEP_CLOTHES her real clothes go on the result anyway, so no retry is spent on them)
-        if cl.sum() > 2000 and (AI_ONLY or not KEEP_CLOTHES):
+        if cl.sum() > 2000 and (AI_ONLY or not KEEP_CLOTHES or IMAGE_PROVIDER == "gemini"):
             la = cv2.cvtColor(crop, cv2.COLOR_RGB2LAB).astype(np.float32)
             lb = cv2.cvtColor(out_s, cv2.COLOR_RGB2LAB).astype(np.float32)
             # colour of the garment (broad): allow the lighting to change a little, not the colour
@@ -433,12 +435,12 @@ def check_result(crop: np.ndarray, lm: np.ndarray, out: np.ndarray, out_lm, seg_
                 why.append("her clothes changed colour; keep her clothing exactly as in image 1")
         # the strict clothes guardrail: her garment must still be there, in the same shape and place
         fit = garment_fit(crop, seg_src, out, seg_out, M)
-        if fit is not None and fit[2] < 0.5 and (AI_ONLY or not KEEP_CLOTHES):
+        if fit is not None and fit[2] < 0.5 and (AI_ONLY or not KEEP_CLOTHES or IMAGE_PROVIDER == "gemini"):
             score += 20 + (0.5 - fit[2]) * 40
             why.append("her clothes, pose or body were changed; this is an edit of image 1: keep her exact clothes, "
                        "pose, arms and hands and change only the hair and the background")
         gap = skin_tone_gap(crop, seg_src, out, seg_out)
-        if gap is not None and (AI_ONLY or SKIN_TONE <= 0):  # otherwise her tone is put back afterwards anyway
+        if gap is not None and (AI_ONLY or SKIN_TONE <= 0 or IMAGE_PROVIDER == "gemini"):  # otherwise her tone is put back afterwards anyway
             dL, dc = gap
             # lightness only: the colour of her photo is often off (office or bulb light), not her skin
             if abs(dL) > 7:
@@ -686,9 +688,12 @@ async def ai_edit(crop: np.ndarray, wig_rgb: np.ndarray | None, prompt: str, kee
     if IMAGE_PROVIDER == "gemini":
         try:
             # Gemini has no edit mask; the face, body and clothes are protected by the instruction and put back after
-            return await gemini_edit(crop, wig_rgb, prompt)
+            img = await gemini_edit(crop, wig_rgb, prompt)
+            _made_by.set("gemini")
+            return img
         except Exception as e:
             log.warning("Gemini image edit failed, using OpenAI instead: %s", e)
+    _made_by.set("openai")
     images = [("customer.png", encode(crop), "image/png")]
     if wig_rgb is not None:
         images.append(("wig.png", encode(wig_rgb), "image/png"))
@@ -936,10 +941,20 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
             break
         note = why
     score, out, seg_out, out_lm, why = best
+    # Gemini keeps the person, so its picture is used as it is wherever it passed the checks; only what a check
+    # flagged gets fixed from her photo (every paste is a possible seam, so none is done without a reason).
+    # With OpenAI (which redraws everything) all the protections run as before.
+    gem = _made_by.get() == "gemini"
+    fix_face = (not gem) or out_lm is None or "face" in why or "skin was made" in why
+    fix_clothes = (not gem) or "clothes" in why or "pose or body" in why
+    fix_frame = (not gem) or "smaller or bigger" in why or "moved" in why
+    if gem:
+        log.info("picture by Gemini; fixing: %s", ", ".join(n for n, f in (("face", fix_face), ("clothes", fix_clothes),
+                                                                          ("framing", fix_frame)) if f) or "nothing")
     # Her face stays her face: her own (smoothed) face goes back on the result, and the result's skin
     # (neck, ears, chest) is first brought to her exact skin colour so there is no edge where they meet.
     locked = False
-    if SKIN_TONE > 0 and seg_src is not None and seg_out is not None:
+    if fix_face and SKIN_TONE > 0 and seg_src is not None and seg_out is not None:
         gap = skin_tone_gap(sent, seg_src, out, seg_out)
         out = keep_skin_tone(sent, seg_src, out, seg_out, SKIN_TONE, exact=KEEP_FACE)
         log.info("skin tone kept (was off by L %.1f, colour %.1f)", *(gap or (0, 0)))
@@ -950,7 +965,7 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
     likeness = face_match(sent, lm, out, out_lm) if face_ok else 0.0
     if face_ok and likeness < FACE_MATCH_MIN:
         face_ok = False  # features are in place but don't look like hers closely enough
-    if KEEP_FACE and not face_ok:
+    if KEEP_FACE and not face_ok and fix_face:
         # her real face, with a light smoothing so the result is still retouched
         mine = sent if FACE_ENHANCE > 0 else beautify(sent, lm, FALLBACK_SMOOTH, style="natural", skin_extra=body)
         hair_ai = None if seg_out is None else seg_out[..., HAIR]
@@ -962,12 +977,14 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
         # Do not recolour the forehead after face-locking. Segmentation can label forehead skin
         # inconsistently; shifting its LAB colour creates the visible rectangular/patchy marks.
         # The original forehead is preserved by face_lock and the wig remains in front where detected.
+    elif not fix_face:
+        log.info("face kept as Gemini drew it (passed the face checks)")
     else:
         log.info("AI's lightly retouched face used (likeness %.2f)", likeness)
     # Her clothes stay her clothes, by construction: her real body and clothes from her photo, placed
     # relative to her face exactly as in her photo, under the new hair; anything the AI invented
     # outside her body becomes backdrop.
-    if KEEP_CLOTHES and seg_src is not None and seg_out is not None:
+    if fix_clothes and KEEP_CLOTHES and seg_src is not None and seg_out is not None:
         M = align(lm, out_lm) if out_lm is not None else None
         if M is None and out_lm is not None:
             M = align(lm, out_lm, strict=False)
@@ -1000,7 +1017,8 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
     # Deliver exactly what she gave: the result is put back into HER photo's frame, so her body is the same
     # size and in the same place as in her photo, and the picture ends where her photo ends (a half photo
     # gives a half result, the wig running off the edge). Anything the AI drew beyond her frame is dropped.
-    out = await to_her_frame(out, lm, sent, seg_src)
+    if fix_frame:
+        out = await to_her_frame(out, lm, sent, seg_src)
     # The wig must cover her whole head: if a side or the top is still bare, the AI adds the wig's hair there
     out = await fill_head_gaps(out, lm, wig_rgb, p)
     # Never hands she isn't showing: if any are still in the picture, the AI repaints only those areas
