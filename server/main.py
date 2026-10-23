@@ -887,7 +887,8 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
     if KEEP_FACE and not face_ok:
         # her real face, with a light smoothing so the result is still retouched
         mine = sent if FACE_ENHANCE > 0 else beautify(sent, lm, FALLBACK_SMOOTH, style="natural", skin_extra=body)
-        out, locked = face_lock(mine, lm, out, out_lm, bool(p.get("bangs")), enhance=0, relight=0.0)
+        out, locked = face_lock(mine, lm, out, out_lm, bool(p.get("bangs")), enhance=0, relight=0.0,
+                                ai_hair=None if seg_out is None else seg_out[..., HAIR])
         log.info("her own face kept (AI face likeness %.2f): %s", likeness, locked)
         if seg_out is not None:  # one skin tone from chin to hairline: no lighter "bald" block above the brows
             out = match_forehead(out, seg_out, out_lm)
