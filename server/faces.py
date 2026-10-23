@@ -992,7 +992,7 @@ def beautify(rgb: np.ndarray, lm: np.ndarray, strength: float = 0.75, style: str
     lo_blur = _masked_blur(img, w, s_lo)
     fine = img - hi_blur
     mid = hi_blur - lo_blur
-    smooth = lo_blur + mid * (1 - 0.45 * k) + fine
+    smooth = lo_blur + mid * (1 - 0.6 * k) + fine  # smoother skin; broad tone and pores unchanged
     a = skin[..., None]
     img = img * (1 - a) + smooth * a
 
@@ -1530,3 +1530,31 @@ def added_hands(seg_src: np.ndarray, seg_out: np.ndarray, M: np.ndarray) -> np.n
         if stats[i][4] > 0.003 * H * W:
             out[lab_ == i] = 1
     return out
+
+
+def head_gaps(lm_out: np.ndarray, seg_out: np.ndarray) -> str:
+    """Where the wig fails to cover her head: checks a band around the top and sides of her face (forehead
+    line up to the crown, temples, beside the ears) for hair. Returns "" or e.g. "left side"."""
+    H, W = seg_out.shape[:2]
+    oval = lm_out[FACE_OVAL]
+    c = oval.mean(axis=0)
+    g = geom(lm_out)
+    outer = np.zeros((H, W), np.uint8)
+    inner = np.zeros((H, W), np.uint8)
+    cv2.fillPoly(outer, [np.round(c + (oval - c) * 1.35 + g.up * 0.12 * g.height).astype(np.int32)], 1)
+    cv2.fillPoly(inner, [np.round(c + (oval - c) * 1.04).astype(np.int32)], 1)
+    ring = (outer > 0) & (inner == 0)
+    # only the upper part (eyes up) and the sides down to the mouth: below that the hair may fall away
+    ys, xs = np.mgrid[0:H, 0:W]
+    height = (xs - g.chin[0]) * g.up[0] + (ys - g.chin[1]) * g.up[1]
+    ring &= height > 0.35 * g.height
+    side = -(xs - c[0]) * g.up[1] + (ys - c[1]) * g.up[0]  # across the face axis: picture-left < 0
+    hair = seg_out[..., HAIR] > 0.4
+    bad = []
+    for name, sel in (("left side (as seen in the picture)", side < -0.15 * g.width),
+                      ("right side (as seen in the picture)", side > 0.15 * g.width),
+                      ("top", np.abs(side) <= 0.15 * g.width)):
+        r = ring & sel
+        if r.sum() > 200 and hair[r].mean() < 0.45:
+            bad.append(name)
+    return " and ".join(bad)
