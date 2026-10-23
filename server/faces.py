@@ -1394,7 +1394,7 @@ def keep_body(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np
     # added above/beside a close selfie) the AI's drawing is the only picture there is, so it stays.
     cover = np.ones(src.shape[:2], np.float32) if valid is None else valid.astype(np.float32)
     cover = warp(cover) > 0.99
-    cover = cv2.erode(cover.astype(np.uint8), np.ones((int(0.03 * W) | 1,) * 2, np.uint8)).astype(bool)
+    cover = cv2.erode(cover.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)  # right up to her photo's edge
     was_bg &= cover
     invented = ((ai_body > 0.5) & was_bg & (new_hair < 0.35)).astype(np.uint8)
     invented = cv2.morphologyEx(invented, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
