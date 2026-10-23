@@ -24,7 +24,7 @@ import catalog_store
 import db
 from status import STATUS
 from admin import router as admin_router
-from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, added_hands, keep_body, match_backdrop, no_new_hands, tidy_body, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
+from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, added_hands, head_gaps, keep_body, match_backdrop, no_new_hands, tidy_body, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -56,7 +56,7 @@ KEEP_CLOTHES = os.getenv("KEEP_CLOTHES", "on").lower() not in ("0", "off", "fals
 KEEP_FACE = os.getenv("KEEP_FACE", "on").lower() not in ("0", "off", "false", "no")
 SKIN_TONE = max(0.0, min(1.0, float(os.getenv("SKIN_TONE", "1"))))
 TRYON_ATTEMPTS = max(1, min(3, int(os.getenv("TRYON_ATTEMPTS", "3"))))
-FACE_ENHANCE = min(1.0, max(0.0, float(os.getenv("FACE_ENHANCE", "0.75"))))  # retouch strength: 0 = off, 0.75 = default, 1 = strongest
+FACE_ENHANCE = min(1.0, max(0.0, float(os.getenv("FACE_ENHANCE", "1.0"))))  # retouch strength: 0 = off, 0.75 = default, 1 = strongest
 OUT_W, OUT_H = 1024, 1536
 MAX_UPLOAD = 15 * 1024 * 1024
 MAX_TRIES = int(os.getenv("MAX_TRYONS_PER_PERSON", "10"))  # cost guard per customer session
@@ -220,7 +220,9 @@ def build_prompt_pure(p: dict, retry_note: str = "", outfit: str = "") -> str:
         "start, the same colours and ombre in the same places, the same length, density and fullness. Do not invent a "
         "different style. Fit it like a professionally installed wig: flush and snug on the scalp, the top close to the "
         "head, a soft natural hairline blending into her forehead and temples, no visible lace, cap or edges. The hair "
-        "covers both ears completely and falls naturally over the shoulders and down the front and back, as long as the "
+        "covers her WHOLE head: the crown, both temples and both sides, with no bare scalp, gap or background "
+        "showing anywhere around her head (with a side part, braids still lie flat over the scalp on the other side). "
+        "It covers both ears completely and falls naturally over the shoulders and down the front and back, as long as the "
         "wig is, full and dense with no thin or see-through patches, with real volume, shadows and light, casting soft shadows on the neck and shoulders where it touches "
         "them. Completely hide her own hair and anything on her head (scarf, cap, hood, headphones, bonnet) under the wig.\n\n"
         "THE FACE: the face in image 1 is already professionally retouched. Keep it EXACTLY as it is: do not redraw, "
@@ -290,6 +292,14 @@ def check_result(crop: np.ndarray, lm: np.ndarray, out: np.ndarray, out_lm, seg_
     if shape_err > 0.022:
         score += (shape_err - 0.022) * 400 + 3
         why.append("her facial features changed; keep exactly the same eyes, nose, lips and face shape")
+    if seg_out is not None:
+        # the wig must cover her whole head: hair all around the top and both sides of the face
+        miss = head_gaps(lm @ M[:, :2].T + M[:, 2], seg_out)
+        if miss:
+            score += 12
+            why.append(f"the wig does not cover the {miss} of her head (bare scalp or background shows there); the wig "
+                       "must cover her whole head and both sides of the face like a real installed wig, even with a "
+                       "side part: braids lie flat over the scalp on both sides and cover both ears")
     if seg_src is not None and seg_out is not None:
         hands = added_hands(seg_src, seg_out, M)
         if hands.any():
@@ -561,7 +571,7 @@ async def blend_pass(comp: np.ndarray, sent: np.ndarray, lm: np.ndarray, seg_src
         if SKIN_TONE > 0 and seg_src is not None:
             out2 = keep_skin_tone(sent, seg_src, out2, o_seg, SKIN_TONE, exact=KEEP_FACE)
         if KEEP_FACE:
-            out2, _ = face_lock(sent, lm, out2, o_lm, bool(p.get("bangs")), enhance=0, relight=0.4)
+            out2, _ = face_lock(sent, lm, out2, o_lm, bool(p.get("bangs")), enhance=0, relight=0.0)
         if KEEP_CLOTHES:
             out2, how = keep_body(sent, seg_src, out2, o_seg, M2, inset=max(4, int(0.012 * W)))
             log.info("blend pass: her clothes %s", how)
@@ -682,7 +692,7 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
         out = keep_skin_tone(sent, seg_src, out, seg_out, SKIN_TONE, exact=KEEP_FACE)
         log.info("skin tone kept (was off by L %.1f, colour %.1f)", *(gap or (0, 0)))
     if KEEP_FACE:
-        out, locked = face_lock(sent, lm, out, out_lm, bool(p.get("bangs")), enhance=0, relight=0.4)
+        out, locked = face_lock(sent, lm, out, out_lm, bool(p.get("bangs")), enhance=0, relight=0.0)
         log.info("her own face kept: %s", locked)
     # Her clothes stay her clothes, by construction: her real body and clothes from her photo, placed
     # relative to her face exactly as in her photo, under the new hair; anything the AI invented
