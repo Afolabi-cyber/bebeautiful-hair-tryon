@@ -1282,6 +1282,8 @@ def garment_fit(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: 
         c_src = cv2.warpAffine(c_src, T, (W, H))
     # compare only where the new hair doesn't cover (long hair hides part of any garment)
     free = seg_out[..., HAIR] < 0.35
+    # only inside her photo: below a close selfie the AI simply continues her top, that is not a change
+    free &= cv2.warpAffine(np.ones(src.shape[:2], np.float32), M, (W, H)) > 0.99
     a, b = (c_src > 0.5) & free, (c_out > 0.5) & free
     iou = float((a & b).sum()) / float((a | b).sum() + 1)
     return src_w, c_src, iou
@@ -1441,7 +1443,7 @@ def tidy_body(out: np.ndarray, seg: np.ndarray) -> tuple[np.ndarray, int]:
     main = max(range(1, n), key=lambda i: (face[lab_ == i].sum(), stats[i][4]))  # the piece with her face
     stray = np.zeros((H, W), np.uint8)
     for i in range(1, n):
-        if i != main and stats[i][4] < 0.06 * H * W:
+        if i != main and stats[i][4] < 0.015 * H * W:  # specks and slivers, never a real part of the picture
             stray[lab_ == i] = 1
     stray &= ((seg[..., HAIR] < 0.35)).astype(np.uint8)  # loose curls are allowed to float
     if not stray.any():
@@ -1458,13 +1460,16 @@ def tidy_body(out: np.ndarray, seg: np.ndarray) -> tuple[np.ndarray, int]:
     return _to_u8(res), int(n - 2)
 
 
-def no_new_hands(out: np.ndarray, seg_out: np.ndarray, src_skin_w: np.ndarray) -> tuple[np.ndarray, int]:
+def no_new_hands(out: np.ndarray, seg_out: np.ndarray, src_skin_w: np.ndarray,
+                 inside: np.ndarray | None = None) -> tuple[np.ndarray, int]:
     """Remove skin the AI drew where her photo has no skin (a second pair of hands, a new arm).
     Her own hands and arms, wherever they are visible, stay; hands hidden behind the new hair stay hidden.
     src_skin_w: her body-skin probability moved onto the result. Returns (image, removed px)."""
     H, W = out.shape[:2]
     mine = cv2.dilate((src_skin_w > 0.3).astype(np.uint8), np.ones((int(0.02 * W) | 1,) * 2, np.uint8))
     new = ((seg_out[..., BODY_SKIN] > 0.5) & (mine == 0) & (seg_out[..., HAIR] < 0.35)).astype(np.uint8)
+    if inside is not None:  # only within her photo: below/around it the AI's picture is all there is
+        new &= cv2.erode(inside.astype(np.uint8), np.ones((int(0.03 * W) | 1,) * 2, np.uint8))
     new = cv2.morphologyEx(new, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     # only real pieces (a hand is not a few stray pixels)
     n, lab_, stats, _ = cv2.connectedComponentsWithStats(new, connectivity=8)
