@@ -1653,15 +1653,17 @@ def bare_scalp(lm_out: np.ndarray, seg_out: np.ndarray, want_mask: bool = False)
     height = (xs - g.chin[0]) * g.up[0] + (ys - g.chin[1]) * g.up[1]
     across = -(xs - c[0]) * g.up[1] + (ys - c[1]) * g.up[0]
     brow = float(((lm_out[BROWS] - g.chin) @ g.up).max())
-    top = (height > brow + 0.28 * g.height) & (height < brow + 0.6 * g.height) & (np.abs(across) < 0.22 * g.width)
+    # start just above the top of her forehead (face-mesh point 10), never on the forehead itself
+    fore = float((lm_out[FOREHEAD] - g.chin) @ g.up)
+    top = (height > fore + 0.06 * g.height) & (height < fore + 0.4 * g.height) & (np.abs(across) < 0.35 * g.width)
     if top.sum() < 300:
         return False
     skin = (seg_out[..., FACE_SKIN] + seg_out[..., BODY_SKIN]) > 0.5
-    bad = float(skin[top].mean()) > 0.3
+    bad = float(skin[top].mean()) > 0.12 or int((skin & top).sum()) > 0.02 * g.width * g.height
     if not want_mask:
         return bad
     # the skin above a normal hairline, across the whole top of the head (to be covered with hair)
-    crown = (height > brow + 0.22 * g.height) & (np.abs(across) < 0.6 * g.width)
+    crown = (height > fore + 0.04 * g.height) & (np.abs(across) < 0.6 * g.width)
     mask = (crown & skin).astype(np.uint8) if bad else np.zeros((H, W), np.uint8)
     mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(0.06 * g.width) | 1,) * 2))
     return bad, mask
