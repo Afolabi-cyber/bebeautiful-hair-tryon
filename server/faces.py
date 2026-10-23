@@ -862,7 +862,7 @@ def geom(lm: np.ndarray) -> FaceGeom:
     return FaceGeom(up=v / max(h, 1e-6), height=h, width=float(np.linalg.norm(lm[234] - lm[454])), chin=lm[CHIN])
 
 
-def make_room(rgb: np.ndarray, lm: np.ndarray, aspect: float = 2 / 3):
+def make_room(rgb: np.ndarray, lm: np.ndarray, aspect: float = 2 / 3, fill=(226, 226, 226)):
     """Close selfies leave no room above the head (or below the chin) for a wig. Extend the canvas so a
     full head-and-shoulders frame fits; the extension is a soft, blurred continuation that the AI repaints
     (hair, top of the head, shoulders, backdrop). Returns (image, landmarks, valid) where valid is 1 on
@@ -886,10 +886,11 @@ def make_room(rgb: np.ndarray, lm: np.ndarray, aspect: float = 2 / 3):
     if max(pt, pb, pl, pr) == 0:
         return rgb, lm, valid
     # The added room is plain light backdrop (stretched edge pixels would give the AI streaks to copy)
-    big = cv2.copyMakeBorder(rgb, pt, pb, pl, pr, cv2.BORDER_CONSTANT, value=(226, 226, 226))
+    big = cv2.copyMakeBorder(rgb, pt, pb, pl, pr, cv2.BORDER_CONSTANT, value=tuple(int(v) for v in fill))
     valid = cv2.copyMakeBorder(valid, pt, pb, pl, pr, cv2.BORDER_CONSTANT, value=0)
     m = cv2.GaussianBlur((1 - valid).astype(np.float32), (0, 0), 6)[..., None]
-    plain = np.full_like(big, 226)
+    plain = np.empty_like(big)
+    plain[:] = fill
     big = np.clip(big * (1 - m) + plain * m, 0, 255).astype(np.uint8)
     return big, lm + np.float32([pl, pt]), valid
 
@@ -1493,3 +1494,37 @@ def no_new_hands(out: np.ndarray, seg_out: np.ndarray, src_skin_w: np.ndarray,
     a = (a * (1 - np.clip((seg_out[..., HAIR] - 0.2) / 0.3, 0, 1)))[..., None]
     res = out.astype(np.float32) * (1 - a) + plate * a
     return _to_u8(res), int(keep.sum())
+
+
+def match_backdrop(out: np.ndarray, seg: np.ndarray, rgb) -> np.ndarray:
+    """Bring the plain backdrop to an exact colour. The AI paints the backdrop close to the asked colour;
+    this shifts it the rest of the way, smoothly (keeping the AI's soft light and shadows), and fades the
+    shift out towards her and the hair so edges stay natural."""
+    bg = seg[..., BG]
+    core = bg > 0.9
+    if core.sum() < 2000:
+        return out
+    lab = _lab(out)
+    target = _lab(np.uint8(rgb).reshape(1, 1, 3))[0, 0]
+    shift = target - np.median(lab[core], axis=0)
+    W = out.shape[1]
+    w = cv2.GaussianBlur(np.clip((bg - 0.5) / 0.4, 0, 1).astype(np.float32), (0, 0), max(2.0, 0.004 * W))
+    lab += shift[None, None, :] * w[..., None]
+    return _to_u8(_rgb(lab))
+
+
+def added_hands(seg_src: np.ndarray, seg_out: np.ndarray, M: np.ndarray) -> np.ndarray:
+    """uint8 mask of hands/arms (skin) in the result that are not in her photo. Her face, neck and any
+    skin she shows are excluded (with a margin), hair over skin is ignored, specks are ignored."""
+    H, W = seg_out.shape[:2]
+    her = np.clip(seg_src[..., BODY_SKIN] + seg_src[..., FACE_SKIN], 0, 1).astype(np.float32)
+    her = cv2.warpAffine(np.ascontiguousarray(her), M, (W, H)) > 0.3
+    her = cv2.dilate(her.astype(np.uint8), np.ones((int(0.04 * W) | 1,) * 2, np.uint8))
+    new = ((seg_out[..., BODY_SKIN] > 0.5) & (her == 0) & (seg_out[..., HAIR] < 0.35)).astype(np.uint8)
+    new = cv2.morphologyEx(new, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    n, lab_, stats, _ = cv2.connectedComponentsWithStats(new, connectivity=8)
+    out = np.zeros_like(new)
+    for i in range(1, n):
+        if stats[i][4] > 0.003 * H * W:
+            out[lab_ == i] = 1
+    return out
