@@ -51,7 +51,7 @@ export default function Welcome({ brand, products, preset, initial, onContinue }
 
       <form onSubmit={submit} className="px-6 pt-5 safe-bottom">
         <h1 className="font-display text-[38px] leading-[1.05]">
-          Own your <span className="text-brand">look!</span>
+          Own your <span className="text-brand">blend!</span>
         </h1>
         <p className="mt-2.5 text-[15px] leading-relaxed text-cocoa">
           {preset
