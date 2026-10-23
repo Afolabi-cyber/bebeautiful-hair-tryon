@@ -1338,7 +1338,7 @@ def restore_clothes(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_o
 
 def keep_body(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np.ndarray,
               M: np.ndarray, inset: int = 2, follow: bool = False,
-              valid: np.ndarray | None = None) -> tuple[np.ndarray, str]:
+              valid: np.ndarray | None = None, no_paste: np.ndarray | None = None) -> tuple[np.ndarray, str]:
     """Her own body and clothes, always, by construction (whatever the AI drew there).
 
     The AI's picture supplies only the new hair, the head and the backdrop. Her real clothes, arms,
@@ -1423,6 +1423,8 @@ def keep_body(src: np.ndarray, seg_src: np.ndarray, out: np.ndarray, seg_out: np
         there = cv2.dilate((ai_body > 0.5).astype(np.uint8), np.ones((5, 5), np.uint8)).astype(np.float32)
         keep *= there
     keep = keep * inside
+    if no_paste is not None:  # (e.g. the neck under an AI face: the AI's own neck joins it seamlessly)
+        keep *= 1 - cv2.GaussianBlur(no_paste.astype(np.float32), (0, 0), max(2.0, 0.01 * W))
     if valid is not None:  # nor from the soft room added around a close selfie
         keep *= cv2.erode((warp(valid.astype(np.float32)) > 0.99).astype(np.uint8), np.ones((5, 5), np.uint8))
     keep = cv2.GaussianBlur(keep * (1 - block), (0, 0), max(1.0, inset / 2.5))[..., None]
@@ -1510,7 +1512,22 @@ def match_backdrop(out: np.ndarray, seg: np.ndarray, rgb) -> np.ndarray:
     like = np.clip((60.0 - d) / 25.0, 0, 1)
     # a plain grey/white area the AI left (no pink at all) is backdrop too when the segmenter is sure
     like = np.maximum(like, (seg[..., BG] > 0.95) * (np.hypot(lab[..., 1] - 128, lab[..., 2] - 128) < 12))
-    w = (bg * like).astype(np.float32)[..., None]  # no extra blur: thin strands stay their own colour
+    # any pink/magenta shade the AI painted (lighter or deeper than asked) is backdrop too
+    pinkish = np.clip((lab[..., 1] - 128 - 15) / 10, 0, 1) * np.clip((15 - (lab[..., 2] - 128)) / 10, 0, 1)
+    like = np.maximum(like, pinkish)
+    # never inside her silhouette (glasses lenses, gaps between arm and body, reflections): only the
+    # background that is connected to the edges of the picture is backdrop
+    person = (seg[..., BG] < 0.5).astype(np.uint8)
+    inv = (1 - person).astype(np.uint8)
+    n, lab_, stats, _ = cv2.connectedComponentsWithStats(inv, connectivity=4)
+    H = out.shape[0]
+    outside = np.zeros_like(inv)
+    for i in range(1, n):
+        x, y, w_, h_, _a = stats[i]
+        if x == 0 or y == 0 or x + w_ >= W or y + h_ >= H:
+            outside[lab_ == i] = 1
+    outside = cv2.GaussianBlur(outside.astype(np.float32), (0, 0), 1.0)
+    w = (bg * like * outside).astype(np.float32)[..., None]  # no extra blur: thin strands keep their colour
     flat = np.empty_like(lab)
     flat[:] = target
     return _to_u8(_rgb(lab * (1 - w) + flat * w))
@@ -1559,6 +1576,14 @@ def head_gaps(lm_out: np.ndarray, seg_out: np.ndarray, want_mask: bool = False):
         if r.sum() > 200 and hair[r].mean() < 0.45:
             bad.append(name)
             mask |= (r & ~hair).astype(np.uint8)
+    # hair over BOTH shoulders: beside the neck, from the chin down, on each side of the face
+    below = (height < 0.05 * g.height) & (height > -0.7 * g.height)
+    for name, sel in (("left shoulder (as seen in the picture)", (side < -0.55 * g.width) & (side > -1.15 * g.width)),
+                      ("right shoulder (as seen in the picture)", (side > 0.55 * g.width) & (side < 1.15 * g.width))):
+        r = below & sel
+        if r.sum() > 400 and hair[r].mean() < 0.3:
+            bad.append(name)
+            mask |= (r & ~hair).astype(np.uint8)
     text = " and ".join(bad)
     if not want_mask:
         return text
@@ -1566,6 +1591,47 @@ def head_gaps(lm_out: np.ndarray, seg_out: np.ndarray, want_mask: bool = False):
         # room for the braids to fall: widen outward and down the side, never into the face
         big = np.zeros((H, W), np.uint8)
         cv2.fillPoly(big, [np.round(c + (oval - c) * 1.7 + g.up * 0.15 * g.height).astype(np.int32)], 1)
+        big |= (below & (np.abs(side) < 1.2 * g.width)).astype(np.uint8)  # down over the shoulders too
         grow = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(0.25 * g.width) | 1,) * 2))
         mask = (grow & big & (inner == 0)).astype(np.uint8)
     return text, mask
+
+
+def face_match(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.ndarray) -> float:
+    """How closely the result's eyes, brows, nose and mouth look like hers (not just where they are):
+    the result is lined up on her face and the feature areas are compared in grey, after removing overall
+    brightness and contrast (so light smoothing and relighting don't count). 1 = identical, 0 = unrelated."""
+    M = align(src_lm, out_lm, strict=False)
+    if M is None:
+        return 0.0
+    H, W = src.shape[:2]
+    back = cv2.warpAffine(out, cv2.invertAffineTransform(M), (W, H), flags=cv2.INTER_LINEAR)
+    g = geom(src_lm)
+    fw = float(np.linalg.norm(src_lm[234] - src_lm[454]))
+    feats = np.zeros((H, W), np.uint8)
+    for idx, grow in ((LEFT_EYE, 0.06), (RIGHT_EYE, 0.06), (LEFT_BROW, 0.04), (RIGHT_BROW, 0.04),
+                      (LIPS, 0.04), (NOSTRILS, 0.04)):
+        feats = np.maximum(feats, (_poly_mask((H, W), src_lm[idx], grow=max(1, int(grow * fw))) > 0.5).astype(np.uint8))
+    m = feats > 0
+    if m.sum() < 200:
+        return 0.0
+    a = cv2.cvtColor(src, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    b = cv2.cvtColor(back, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    # detail only (features), not broad light
+    s = max(2.0, 0.03 * fw)
+    a -= cv2.GaussianBlur(a, (0, 0), s)
+    b -= cv2.GaussianBlur(b, (0, 0), s)
+    a, b = a[m], b[m]
+    a = (a - a.mean()) / (a.std() + 1e-3)
+    b = (b - b.mean()) / (b.std() + 1e-3)
+    return float((a * b).mean())
+
+
+def neck_band(shape, lm: np.ndarray) -> np.ndarray:
+    """uint8 mask of the jaw/neck area just under the chin (where an AI face meets her real neck)."""
+    H, W = shape[:2]
+    g = geom(lm)
+    ys, xs = np.mgrid[0:H, 0:W]
+    height = (xs - g.chin[0]) * g.up[0] + (ys - g.chin[1]) * g.up[1]
+    across = -(xs - g.chin[0]) * g.up[1] + (ys - g.chin[1]) * g.up[0]
+    return ((height < 0.15 * g.height) & (height > -0.45 * g.height) & (np.abs(across) < 0.7 * g.width)).astype(np.uint8)
