@@ -1443,3 +1443,26 @@ def tidy_body(out: np.ndarray, seg: np.ndarray) -> tuple[np.ndarray, int]:
     a = (a * (1 - np.clip((seg[..., HAIR] - 0.2) / 0.3, 0, 1)))[..., None]
     res = out.astype(np.float32) * (1 - a) + plate * a
     return _to_u8(res), int(n - 2)
+
+
+def no_new_hands(out: np.ndarray, seg_out: np.ndarray, src_skin_w: np.ndarray) -> tuple[np.ndarray, int]:
+    """Remove skin the AI drew where her photo has no skin (a second pair of hands, a new arm).
+    Her own hands and arms, wherever they are visible, stay; hands hidden behind the new hair stay hidden.
+    src_skin_w: her body-skin probability moved onto the result. Returns (image, removed px)."""
+    H, W = out.shape[:2]
+    mine = cv2.dilate((src_skin_w > 0.3).astype(np.uint8), np.ones((int(0.02 * W) | 1,) * 2, np.uint8))
+    new = ((seg_out[..., BODY_SKIN] > 0.5) & (mine == 0) & (seg_out[..., HAIR] < 0.35)).astype(np.uint8)
+    new = cv2.morphologyEx(new, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    # only real pieces (a hand is not a few stray pixels)
+    n, lab_, stats, _ = cv2.connectedComponentsWithStats(new, connectivity=8)
+    keep = np.zeros_like(new)
+    for i in range(1, n):
+        if stats[i][4] > 0.002 * H * W:
+            keep[lab_ == i] = 1
+    if not keep.any():
+        return out, 0
+    m = cv2.dilate(keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+    res = cv2.inpaint(out, m * 255, max(5, int(0.01 * W)), cv2.INPAINT_TELEA)
+    a = cv2.GaussianBlur(m.astype(np.float32), (0, 0), 2.0)[..., None]
+    res = out.astype(np.float32) * (1 - a) + res.astype(np.float32) * a
+    return _to_u8(res), int(keep.sum())
