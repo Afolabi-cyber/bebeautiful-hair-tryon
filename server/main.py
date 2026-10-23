@@ -24,7 +24,7 @@ import catalog_store
 import db
 from status import STATUS
 from admin import router as admin_router
-from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, added_hands, bare_scalp, mirror_hair, face_match, head_gaps, neck_band, keep_body, match_backdrop, no_new_hands, tidy_body, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
+from faces import BODY_SKIN, CLOTHES, FACE_OVAL, beautify, clean_photo, HAIR, LEFT_BROW, LEFT_EYE, LIPS, NOSTRILS, RIGHT_BROW, RIGHT_EYE, FaceTool, align, geom, backdrop, clothes_keep, compose_ai, face_lock, garment_fit, added_hands, bare_scalp, covered_hairline, hair_hint, mirror_hair, face_match, head_gaps, neck_band, keep_body, match_backdrop, no_new_hands, tidy_body, keep_clothes, restore_clothes, make_room, Segmenter, hair_zone, head_crop, keep_mask, keep_skin_tone, skin_tone_gap, old_hair, openai_mask_png, photo_problem, skin_lock, transfer_hair, wig_shape
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -58,6 +58,7 @@ KEEP_CLOTHES = os.getenv("KEEP_CLOTHES", "on").lower() not in ("0", "off", "fals
 # on: a result that still shows added hands, a bare part of the head or bare scalp is never shown;
 # the customer is asked for a new photo instead (protects the brand)
 QUALITY_GATE = os.getenv("QUALITY_GATE", "off").lower() not in ("0", "off", "false", "no")
+HAIRLINE_HINT = os.getenv("HAIRLINE_HINT", "on").lower() not in ("0", "off", "false", "no")
 FACE_SOURCE = os.getenv("FACE_SOURCE", "photo").strip().lower()  # photo = the setup that fitted well
 # how closely the AI face's eyes, brows, nose and mouth must look like hers (0..1) to be used
 FACE_MATCH_MIN = float(os.getenv("FACE_MATCH_MIN", "0.55"))
@@ -765,13 +766,21 @@ async def run_pure(crop: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dic
     # Protect the face (brows to chin) in the AI edit; the forehead/hairline stays free for the wig
     face_keep = keep_mask(crop.shape, lm, shrink=0.92)
 
+    # A headband/scarf/cap over her hairline, or a very high forehead, gives the AI no hairline to follow and it
+    # reveals bare skin there (the "bald" look). Then the AI gets her photo with the top of the head already in
+    # the wig's hair colour, so it draws the wig's hairline in the right place. Other photos go in unchanged.
+    sent_ai = sent
+    why_hint = covered_hairline(lm, seg_src) if (seg_src is not None and HAIRLINE_HINT) else ""
+    if why_hint:
+        sent_ai = hair_hint(sent, lm, wig_rgb, seg_src)
+        log.info("hairline hint given to the AI (%s)", why_hint)
     outfit = await describe_outfit(crop)
     if outfit:
         log.info("outfit: %s", outfit)
     best, note, tries = None, "", 0
     for attempt in range(TRYON_ATTEMPTS):
         tries += 1
-        out = await ai_edit(sent, wig_rgb, build_prompt_pure(p, note, outfit),
+        out = await ai_edit(sent_ai, wig_rgb, build_prompt_pure(p, note, outfit),
                             keep=face_keep)  # face protected (brows to chin), as when results were good; the hairline stays free
         out_lm = await landmarks(out)
         seg_out = None
