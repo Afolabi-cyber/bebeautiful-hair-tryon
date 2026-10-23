@@ -1738,3 +1738,81 @@ def bare_scalp(lm_out: np.ndarray, seg_out: np.ndarray, want_mask: bool = False,
     mask = (crown & skin).astype(np.uint8) if bad else np.zeros((H, W), np.uint8)
     mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(0.06 * g.width) | 1,) * 2))
     return bad, mask
+
+
+def match_forehead(out: np.ndarray, seg: np.ndarray, lm: np.ndarray) -> np.ndarray:
+    """After her real face goes back, the AI's forehead above it can be a different shade (a lighter or darker
+    block between her brows and the wig, which reads as a bald patch). Bring that forehead skin to the colour of her
+    own skin just below it, smoothly, so face and forehead are one surface up to the wig's hairline."""
+    H, W = out.shape[:2]
+    g = geom(lm)
+    yy, xx = np.mgrid[0:H, 0:W]
+    height = (xx - g.chin[0]) * g.up[0] + (yy - g.chin[1]) * g.up[1]
+    across = -(xx - g.chin[0]) * g.up[1] + (yy - g.chin[1]) * g.up[0]
+    brow = float(((lm[BROWS] - g.chin) @ g.up).max())
+    skin = (seg[..., FACE_SKIN] + seg[..., BODY_SKIN]) > 0.5
+    near = np.abs(across) < 0.6 * g.width
+    ref = skin & near & (height > brow - 0.25 * g.height) & (height < brow - 0.05 * g.height)  # her cheeks/temples level
+    fh = skin & near & (height > brow + 0.04 * g.height)                                          # the AI's forehead
+    if ref.sum() < 300 or fh.sum() < 300:
+        return out
+    lab = _lab(out)
+    shift = np.median(lab[ref], axis=0) - np.median(lab[fh], axis=0)
+    shift[0] = np.clip(shift[0], -40, 40)
+    shift[1:] = np.clip(shift[1:], -15, 15)
+    # fades in above the brows, only on skin, never on the hair
+    w = np.clip((height - brow) / (0.08 * g.height), 0, 1) * (skin & near)
+    w = cv2.GaussianBlur(w.astype(np.float32), (0, 0), max(2.0, 0.01 * W))
+    w *= 1 - np.clip((seg[..., HAIR] - 0.3) / 0.4, 0, 1)
+    lab += shift[None, None, :] * w[..., None]
+    return _to_u8(_rgb(lab))
+
+
+def lower_hairline(out: np.ndarray, seg: np.ndarray, lm: np.ndarray) -> tuple[np.ndarray, float]:
+    """If the wig's hairline sits higher than her own (a bare, bump-like forehead), slide the wig down onto the
+    forehead so it starts where a real wig would. A smooth geometric move of the existing pixels (the AI's own hair
+    is moved, nothing is painted): the forehead between her brows and the old hairline is gently compressed, the hair
+    above is moved down, and the effect fades out towards the sides. Her eyes, brows and everything below are
+    untouched. lm = her own face placed on this picture. Returns (image, how far it moved as a share of face height)."""
+    H, W = out.shape[:2]
+    g = geom(lm)
+    up = g.up.astype(np.float32)
+    c = lm[FACE_OVAL].mean(axis=0)
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    height = (xx - g.chin[0]) * up[0] + (yy - g.chin[1]) * up[1]
+    across = -(xx - c[0]) * up[1] + (yy - c[1]) * up[0]
+    brow = float(((lm[BROWS] - g.chin) @ g.up).max())
+    fore = float((lm[FOREHEAD] - g.chin) @ g.up)
+    hair = seg[..., HAIR] > 0.5
+    # where the hair starts in the middle of the head (from the brows going up)
+    centre = np.abs(across) < 0.18 * g.width
+    step = max(1.0, 0.01 * g.height)
+    h_cur = None
+    h = brow + 0.02 * g.height
+    while h < fore + 0.6 * g.height:
+        row = centre & (np.abs(height - h) < step)
+        if row.sum() > 5 and hair[row].mean() > 0.5:
+            h_cur = h
+            break
+        h += step
+    target = fore - 0.03 * g.height  # a natural wig front, slightly over her own hairline line
+    if h_cur is None or h_cur - target < 0.03 * g.height:
+        return out, 0.0
+    low = brow + 0.03 * g.height           # nothing at or below the brows moves
+    top = fore + 0.75 * g.height           # the crown stays where it is
+    if target <= low + 0.02 * g.height:
+        target = low + 0.02 * g.height
+    # source height for each output height (piecewise linear): low->low, target->h_cur, top->top
+    # forehead below the target stays as it is; from the target up we show the wig from its real hairline up
+    # (the bare strip between is dropped, not squeezed), so the wig's own natural front edge lands at the target
+    src = height.copy()
+    b = (height > target) & (height < top)
+    src[b] = h_cur + (height[b] - target) * (top - h_cur) / (top - target)
+    # full strength across the forehead, fading out by the sides of the head
+    fall = np.clip((1.0 * g.width - np.abs(across)) / (0.45 * g.width), 0, 1)
+    fall = cv2.GaussianBlur(fall, (0, 0), max(2.0, 0.02 * W))
+    d = (src - height) * fall  # move along the face's up direction
+    mx = xx + d * up[0]
+    my = yy + d * up[1]
+    res = cv2.remap(out, mx.astype(np.float32), my.astype(np.float32), cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    return res, float((h_cur - target) / g.height)
