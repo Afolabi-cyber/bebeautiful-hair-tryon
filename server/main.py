@@ -232,7 +232,8 @@ def build_prompt_pure(p: dict, retry_note: str = "", outfit: str = "") -> str:
         "scalp or forehead skin above the hairline: the whole top of the head is covered by the wig up to a natural, "
         "normal-height hairline (cover a high or receding hairline). The hairline sits right at the top of her "
         "forehead, flat and natural: no bump, bulge, raised patch, lace, cap, skin-coloured area or extra forehead on "
-        "top of the head.\n\n"
+        "top of the head. If a headband, scarf, cap or anything else covers part of her forehead or hair in image 1, "
+        "the wig's hairline goes where her natural hairline is: never draw extra forehead skin where it was.\n\n"
         "THE WIG: reproduce image 2 faithfully: the same braid size and pattern, curl type and where the curls "
         "start, the same colours and ombre in the same places, the same length, density and fullness. Do not invent a "
         "different style. Fit it like a professionally installed wig: flush and snug on the scalp, the top close to the "
@@ -326,7 +327,7 @@ def check_result(crop: np.ndarray, lm: np.ndarray, out: np.ndarray, out_lm, seg_
         why.append("her facial features changed; keep exactly the same eyes, nose, lips and face shape")
     if seg_out is not None:
         # the wig must cover her whole head: hair all around the top and both sides of the face
-        if bare_scalp(out_lm, seg_out):
+        if bare_scalp(lm @ M[:, :2].T + M[:, 2], seg_out):
             score += 12
             why.append("bare scalp or forehead skin shows on top of her head (a wide part or an uncovered hairline); "
                        "use a thin natural part and cover the whole top of the head down to a normal hairline")
@@ -640,7 +641,7 @@ async def final_gate(out: np.ndarray, lm: np.ndarray, seg_src, p: dict) -> None:
         problems.append("hands")
     if head_gaps(f_lm, f_seg, shoulders=False):  # the head itself must be covered (shoulders may vary)
         problems.append("head not covered")
-    if bare_scalp(f_lm, f_seg):
+    if bare_scalp(her_face_on(lm, f_lm), f_seg):
         problems.append("bare scalp")
     if problems:
         log.warning("quality gate stopped this result: %s", ", ".join(problems))
@@ -680,14 +681,23 @@ async def to_her_frame(out: np.ndarray, lm: np.ndarray, sent: np.ndarray, seg_sr
         return out
 
 
+def her_face_on(lm: np.ndarray, f_lm: np.ndarray) -> np.ndarray:
+    """Her real face outline from her photo, placed on the result (lined up on eyes, nose, mouth). Used for the
+    head checks so a forehead the AI extended (a bump, a skin patch where a headband was) is never mistaken
+    for her forehead."""
+    M = align(lm, f_lm, strict=False)
+    return f_lm if M is None else (lm @ M[:, :2].T + M[:, 2]).astype(np.float32)
+
+
 async def fill_head_gaps(out: np.ndarray, lm: np.ndarray, wig_rgb: np.ndarray, p: dict) -> np.ndarray:
     try:
         f_lm = await landmarks(out)
         f_seg = await segment(out)
         if f_lm is None or f_seg is None:
             return out
-        miss, area = head_gaps(f_lm, f_seg, want_mask=True, shoulders=is_long(p))
-        bald, top = bare_scalp(f_lm, f_seg, want_mask=True)
+        her = her_face_on(lm, f_lm)
+        miss, area = head_gaps(her, f_seg, want_mask=True, shoulders=is_long(p))
+        bald, top = bare_scalp(her, f_seg, want_mask=True)
         if bald:
             miss = (miss + " and " if miss else "") + "top of the head (bare scalp)"
             area = np.maximum(area, top)
