@@ -1139,7 +1139,8 @@ def _masked_blur(img: np.ndarray, weight: np.ndarray, sigma: float) -> np.ndarra
 
 
 def face_lock(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.ndarray | None,
-              bangs: bool = False, enhance: float = 0.4, relight: float = 1.0) -> tuple[np.ndarray, bool]:
+              bangs: bool = False, enhance: float = 0.4, relight: float = 1.0,
+              ai_hair: np.ndarray | None = None) -> tuple[np.ndarray, bool]:
     """Blend the user's original face back onto the generated image. Returns (image, locked)."""
     if out_lm is None:
         return out, False
@@ -1152,6 +1153,18 @@ def face_lock(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.n
     warped = cv2.warpAffine(src, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
     src_keep = cv2.warpAffine(keep_mask(src.shape, src_lm, bangs), M, (W, H), flags=cv2.INTER_LINEAR)
     region = cv2.min(src_keep, keep_mask(out.shape, out_lm, bangs))
+    if ai_hair is not None:
+        # Her whole face INCLUDING her forehead goes back, up to wherever the AI's hair starts. So no second set of
+        # eyes or brows from the AI's own face can show above hers, and no AI forehead (no "bald" block) remains:
+        # only the wig's hair frames her real face.
+        oval = np.zeros(src.shape[:2], np.uint8)
+        so = src_lm[FACE_OVAL]
+        sc = so.mean(axis=0)
+        cv2.fillPoly(oval, [np.round(sc + (so - sc) * 0.97).astype(np.int32)], 255)
+        full = cv2.warpAffine(oval, M, (W, H), flags=cv2.INTER_LINEAR)
+        hair_m = cv2.dilate((ai_hair > 0.35).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+        full[hair_m] = 0
+        region = np.maximum(region, full)
 
     fw = g_out.width
 
@@ -1175,6 +1188,11 @@ def face_lock(src: np.ndarray, src_lm: np.ndarray, out: np.ndarray, out_lm: np.n
         hair = cv2.morphologyEx(hair, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))  # drop specks
         occluded = cv2.GaussianBlur(cv2.dilate(hair, np.ones((5, 5), np.uint8)), (0, 0), 2).astype(np.float32) / 255.0
 
+    if ai_hair is not None:
+        # we know exactly where the AI's hair is: only that stays over her face (no guessing from colour,
+        # which mistakes the AI's own extra eyes or brows for hair and leaves them showing)
+        hm = cv2.dilate((ai_hair > 0.35).astype(np.uint8) * 255, np.ones((5, 5), np.uint8))
+        occluded = cv2.GaussianBlur(hm, (0, 0), 2).astype(np.float32) / 255.0
     skin = (region > 0).astype(np.float32) * (occluded < 0.3)
 
     # Retouch the customer's own face (skin, tone, light only; nothing moves). enhance=0 turns it off.
