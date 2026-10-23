@@ -1,14 +1,14 @@
 {
   "brand": {
     "name": "Be Beautiful Hair",
-    "tagline": "Own your Look!",
+    "tagline": "Own your Blend!",
     "accent": "#ED008C",
     "website": "https://bebeautifulhair.com"
   },
   "products": [
     {
       "id": "burgundy-copper-boho",
-      "name": "Burgundy Copper Boho",
+      "name": "Red Cappuccino",
       "price": "",
       "image": "wigs/burgundy-copper-boho.png",
       "thumb": "wigs/thumbs/burgundy-copper-boho.webp",
@@ -18,7 +18,7 @@
     },
     {
       "id": "chestnut-side-part-boho",
-      "name": "Chestnut Side-Part Boho",
+      "name": "Hot Chocolate",
       "price": "",
       "image": "wigs/chestnut-side-part-boho.png",
       "thumb": "wigs/thumbs/chestnut-side-part-boho.webp",
@@ -28,7 +28,7 @@
     },
     {
       "id": "honey-ombre-goddess",
-      "name": "Honey Ombre Goddess",
+      "name": "Honeycomb Latte",
       "price": "",
       "image": "wigs/honey-ombre-goddess.png",
       "thumb": "wigs/thumbs/honey-ombre-goddess.webp",
@@ -38,7 +38,7 @@
     },
     {
       "id": "auburn-curly-boho",
-      "name": "Auburn Curly Boho",
+      "name": "Espresso",
       "price": "",
       "image": "wigs/auburn-curly-boho.png",
       "thumb": "wigs/thumbs/auburn-curly-boho.webp",
@@ -48,7 +48,7 @@
     },
     {
       "id": "honey-blonde-boho",
-      "name": "Honey Blonde Boho",
+      "name": "Dirty Latte",
       "price": "",
       "image": "wigs/honey-blonde-boho.png",
       "thumb": "wigs/thumbs/honey-blonde-boho.webp",
@@ -58,7 +58,7 @@
     },
     {
       "id": "ombre-knotless-box",
-      "name": "Ombre Knotless Box Braids",
+      "name": "Red Mocha",
       "price": "",
       "image": "wigs/ombre-knotless-box.png",
       "thumb": "wigs/thumbs/ombre-knotless-box.webp",
